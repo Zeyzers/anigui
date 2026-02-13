@@ -96,7 +96,7 @@ OFFLINE_COVERS_MAP_PATH = os.path.join(app_state_dir(), "offline_covers.json")
 SETTINGS_PATH = os.path.join(app_state_dir(), "settings.json")
 FAVORITES_PATH = os.path.join(app_state_dir(), "favorites.json")
 METADATA_CACHE_PATH = os.path.join(app_state_dir(), "metadata_cache.json")
-APP_VERSION = "1.0.2"
+APP_VERSION = "1.0.3"
 UPDATE_MANIFEST_URL = os.getenv(
     "ANIGUI_UPDATE_MANIFEST_URL",
     "https://raw.githubusercontent.com/Zeyzers/anigui/main/update_manifest.json",
@@ -4937,29 +4937,49 @@ class MainWindow(QMainWindow):
             return
         cur_pid = os.getpid()
         bat_path = os.path.join(tempfile.gettempdir(), f"anigui_updater_{int(time.time())}.bat")
+        log_path = os.path.join(tempfile.gettempdir(), "anigui_updater.log")
         bat = (
             "@echo off\n"
             "setlocal\n"
             f"set \"SRC={src}\"\n"
             f"set \"DST={current_exe}\"\n"
             f"set \"PID={cur_pid}\"\n"
+            "set \"MAX_TRIES=60\"\n"
+            "set \"TRY=0\"\n"
+            f"set \"LOG={log_path}\"\n"
+            "echo ==== anigui updater start %date% %time% ==== > \"%LOG%\"\n"
+            "echo SRC=%SRC%>>\"%LOG%\"\n"
+            "echo DST=%DST%>>\"%LOG%\"\n"
+            "echo PID=%PID%>>\"%LOG%\"\n"
             ":waitclose\n"
             "tasklist /FI \"PID eq %PID%\" | findstr /I \"%PID%\" > nul\n"
             "if not errorlevel 1 (\n"
             "  timeout /t 1 /nobreak > nul\n"
             "  goto waitclose\n"
             ")\n"
-            "copy /Y \"%SRC%\" \"%DST%\" > nul\n"
+            "echo Process closed, starting copy retries...>>\"%LOG%\"\n"
+            ":copyretry\n"
+            "set /a TRY=%TRY%+1\n"
+            "copy /Y \"%SRC%\" \"%DST%\" > nul 2> nul\n"
             "if errorlevel 1 (\n"
-            "  copy /Y \"%SRC%\" \"%DST%\" > nul\n"
+            "  echo Copy failed attempt %TRY%>>\"%LOG%\"\n"
+            "  if %TRY% GEQ %MAX_TRIES% goto copyfail\n"
+            "  timeout /t 1 /nobreak > nul\n"
+            "  goto copyretry\n"
             ")\n"
+            "echo Copy ok after %TRY% attempts>>\"%LOG%\"\n"
             "if errorlevel 1 (\n"
             "  start \"\" \"%SRC%\"\n"
             ") else (\n"
             "  start \"\" \"%DST%\"\n"
             ")\n"
             "del \"%SRC%\" > nul 2>&1\n"
+            "echo updater done>>\"%LOG%\"\n"
             "del \"%~f0\" > nul 2>&1\n"
+            "exit /b 0\n"
+            ":copyfail\n"
+            "echo Copy failed permanently, launching downloaded exe>>\"%LOG%\"\n"
+            "start \"\" \"%SRC%\"\n"
         )
         with open(bat_path, "w", encoding="utf-8", newline="\n") as f:
             f.write(bat)
