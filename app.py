@@ -4932,19 +4932,32 @@ class MainWindow(QMainWindow):
         if not os.path.exists(src):
             self.notify_err(self._tr("File update mancante.", "Update file missing."))
             return
+        if not src.lower().endswith(".exe"):
+            self.notify_err(self._tr("Update non valido: file .exe atteso.", "Invalid update: .exe file expected."))
+            return
+        cur_pid = os.getpid()
         bat_path = os.path.join(tempfile.gettempdir(), f"anigui_updater_{int(time.time())}.bat")
         bat = (
             "@echo off\n"
             "setlocal\n"
             f"set \"SRC={src}\"\n"
             f"set \"DST={current_exe}\"\n"
-            "ping 127.0.0.1 -n 3 > nul\n"
+            f"set \"PID={cur_pid}\"\n"
+            ":waitclose\n"
+            "tasklist /FI \"PID eq %PID%\" | findstr /I \"%PID%\" > nul\n"
+            "if not errorlevel 1 (\n"
+            "  timeout /t 1 /nobreak > nul\n"
+            "  goto waitclose\n"
+            ")\n"
             "copy /Y \"%SRC%\" \"%DST%\" > nul\n"
             "if errorlevel 1 (\n"
-            "  ping 127.0.0.1 -n 3 > nul\n"
             "  copy /Y \"%SRC%\" \"%DST%\" > nul\n"
             ")\n"
-            "start \"\" \"%DST%\"\n"
+            "if errorlevel 1 (\n"
+            "  start \"\" \"%SRC%\"\n"
+            ") else (\n"
+            "  start \"\" \"%DST%\"\n"
+            ")\n"
             "del \"%SRC%\" > nul 2>&1\n"
             "del \"%~f0\" > nul 2>&1\n"
         )
