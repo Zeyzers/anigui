@@ -96,6 +96,11 @@ OFFLINE_COVERS_MAP_PATH = os.path.join(app_state_dir(), "offline_covers.json")
 SETTINGS_PATH = os.path.join(app_state_dir(), "settings.json")
 FAVORITES_PATH = os.path.join(app_state_dir(), "favorites.json")
 METADATA_CACHE_PATH = os.path.join(app_state_dir(), "metadata_cache.json")
+APP_VERSION = "0.1.0"
+UPDATE_MANIFEST_URL = os.getenv(
+    "ANIGUI_UPDATE_MANIFEST_URL",
+    "https://raw.githubusercontent.com/Zeyzers/anigui/main/update_manifest.json",
+)
 
 
 def debug_log(msg: str) -> None:
@@ -1620,6 +1625,13 @@ class MainWindow(QMainWindow):
         self.btn_settings_anilist_pull.clicked.connect(self.on_anilist_pull_from_remote)
         self.btn_settings_anilist_pull.setToolTip("Importa watchlist/progressi da AniList")
         row_actions.addWidget(self.btn_settings_anilist_pull, 0)
+        self.btn_settings_update_check = QPushButton("Check updates")
+        self.btn_settings_update_check.clicked.connect(self.on_update_check_clicked)
+        row_actions.addWidget(self.btn_settings_update_check, 0)
+        self.btn_settings_update_apply = QPushButton("Apply update")
+        self.btn_settings_update_apply.clicked.connect(self.on_update_apply_clicked)
+        self.btn_settings_update_apply.setEnabled(False)
+        row_actions.addWidget(self.btn_settings_update_apply, 0)
         row_actions.addStretch(1)
         settings_layout.addLayout(row_actions)
         settings_layout.addStretch(1)
@@ -1699,6 +1711,8 @@ class MainWindow(QMainWindow):
         self._history_episode_progress_for_ui: dict[float, dict[str, Any]] | None = None
         self._history_cover_labels: dict[int, QLabel] = {}
         self._history_section_overlays: dict[int, QWidget] = {}
+        self._update_info: dict[str, Any] | None = None
+        self._update_download_path: str | None = None
         self._search_cards: list[QListWidgetItem] = []
         self._recent_items: list[SearchItem] = []
         self._recent_cards: list[QListWidgetItem] = []
@@ -1811,6 +1825,7 @@ class MainWindow(QMainWindow):
         self._refresh_search_layout()
         self.refresh_offline_library()
         self.refresh_favorites_ui()
+        QTimer.singleShot(1200, self.check_updates_silent)
 
     # ---------------- UI helpers ----------------
     def do_resolve_stream(
@@ -2142,6 +2157,11 @@ class MainWindow(QMainWindow):
         self.btn_settings_anilist_test.setText(self._tr("Test connessione AniList", "Test AniList connection"))
         self.btn_settings_anilist_sync_now.setText(self._tr("Sincronizza ora", "Sync now"))
         self.btn_settings_anilist_pull.setText(self._tr("Importa da AniList", "Import from AniList"))
+        self.btn_settings_update_check.setText(self._tr("Controlla aggiornamenti", "Check updates"))
+        if platform.system() == "Windows" and getattr(sys, "frozen", False):
+            self.btn_settings_update_apply.setText(self._tr("Aggiorna ora", "Update now"))
+        else:
+            self.btn_settings_update_apply.setText(self._tr("Apri pagina update", "Open update page"))
         self.btn_settings_anilist_sync_now.setToolTip(
             self._tr("Invia subito il progresso corrente ad AniList", "Send current progress to AniList now")
         )
@@ -4700,6 +4720,243 @@ class MainWindow(QMainWindow):
             self.set_status("Restore completato.")
         except Exception as ex:
             self.notify_err(f"Restore fallito: {ex}")
+
+    @staticmethod
+    def _version_key(v: str) -> tuple[int, ...]:
+        nums = [int(x) for x in re.findall(r"\d+", str(v or "").strip())]
+        if not nums:
+            return (0,)
+        return tuple(nums)
+
+    @classmethod
+    def _is_version_newer(cls, remote: str, local: str) -> bool:
+        a = list(cls._version_key(remote))
+        b = list(cls._version_key(local))
+        n = max(len(a), len(b))
+        a.extend([0] * (n - len(a)))
+        b.extend([0] * (n - len(b)))
+        return tuple(a) > tuple(b)
+
+    def _update_fetch_manifest_worker(self) -> dict[str, Any]:
+        req = urllib.request.Request(
+            UPDATE_MANIFEST_URL,
+            headers={"User-Agent": "AniPyApp/1.0"},
+        )
+        with urllib.request.urlopen(req, timeout=12.0) as r:
+            raw = r.read().decode("utf-8", errors="replace")
+        data = json.loads(raw)
+        if not isinstance(data, dict):
+            raise ValueError("Manifest update non valido.")
+        latest = str(data.get("version", "")).strip()
+        if not latest:
+            raise ValueError("Manifest update senza campo 'version'.")
+
+        is_win = platform.system() == "Windows"
+        plat = "windows" if is_win else "linux"
+        sect = data.get(plat, {})
+        if not isinstance(sect, dict):
+            sect = {}
+
+        url = str(
+            sect.get("url")
+            or data.get(f"{plat}_url")
+            or data.get("url")
+            or ""
+        ).strip()
+        sha256 = str(
+            sect.get("sha256")
+            or data.get(f"{plat}_sha256")
+            or data.get("sha256")
+            or ""
+        ).strip().lower()
+        page_url = str(
+            data.get("page_url")
+            or data.get("release_url")
+            or url
+            or ""
+        ).strip()
+        notes = str(data.get("notes") or "").strip()
+        available = self._is_version_newer(latest, APP_VERSION)
+        return {
+            "current_version": APP_VERSION,
+            "latest_version": latest,
+            "available": bool(available),
+            "url": url,
+            "sha256": sha256,
+            "page_url": page_url,
+            "notes": notes,
+        }
+
+    def _start_update_check(self, silent: bool):
+        self.btn_settings_update_check.setEnabled(False)
+        w = Worker(self._update_fetch_manifest_worker)
+        w.ok.connect(lambda info, sl=silent: self._on_update_check_ok(info, sl))
+        w.err.connect(lambda msg, sl=silent: self._on_update_check_err(msg, sl))
+        self._workers.append(w)
+        w.start()
+
+    def check_updates_silent(self):
+        self._start_update_check(True)
+
+    def on_update_check_clicked(self):
+        self.set_status(self._tr("Controllo aggiornamenti in corso...", "Checking for updates..."))
+        self._start_update_check(False)
+
+    def _on_update_check_ok(self, info: dict[str, Any], silent: bool):
+        self.btn_settings_update_check.setEnabled(True)
+        self._update_info = info if isinstance(info, dict) else None
+        available = bool((info or {}).get("available"))
+        latest = str((info or {}).get("latest_version", APP_VERSION))
+        if not available:
+            self.btn_settings_update_apply.setEnabled(False)
+            self._update_download_path = None
+            if not silent:
+                QMessageBox.information(
+                    self,
+                    self._tr("Aggiornamenti", "Updates"),
+                    self._tr(
+                        f"Sei gia all'ultima versione ({APP_VERSION}).",
+                        f"You are already on the latest version ({APP_VERSION}).",
+                    ),
+                )
+                self.set_status(self._tr("Nessun aggiornamento disponibile.", "No updates available."))
+            return
+
+        can_apply = bool((info or {}).get("url") or (info or {}).get("page_url"))
+        self.btn_settings_update_apply.setEnabled(can_apply)
+        self._update_download_path = None
+        self.set_status(
+            self._tr(
+                f"Aggiornamento disponibile: {APP_VERSION} -> {latest}",
+                f"Update available: {APP_VERSION} -> {latest}",
+            )
+        )
+        if not silent:
+            QMessageBox.information(
+                self,
+                self._tr("Aggiornamenti", "Updates"),
+                self._tr(
+                    f"Nuova versione disponibile: {latest}",
+                    f"New version available: {latest}",
+                ),
+            )
+
+    def _on_update_check_err(self, msg: str, silent: bool):
+        self.btn_settings_update_check.setEnabled(True)
+        self.btn_settings_update_apply.setEnabled(False)
+        if not silent:
+            self.notify_err(self._tr(f"Check update fallito: {msg}", f"Update check failed: {msg}"))
+            self.set_status(self._tr("Check aggiornamenti fallito.", "Update check failed."))
+
+    def _download_update_worker(self, info: dict[str, Any]) -> str:
+        url = str(info.get("url") or "").strip()
+        if not url:
+            raise ValueError("URL update mancante nel manifest.")
+        expected_sha = str(info.get("sha256") or "").strip().lower()
+        req = urllib.request.Request(url, headers={"User-Agent": "AniPyApp/1.0"})
+        suffix = ".exe" if platform.system() == "Windows" else ".bin"
+        fd, tmp_path = tempfile.mkstemp(prefix="anigui_update_", suffix=suffix)
+        os.close(fd)
+        hasher = hashlib.sha256()
+        try:
+            with urllib.request.urlopen(req, timeout=20.0) as r, open(tmp_path, "wb") as f:
+                while True:
+                    chunk = r.read(512 * 1024)
+                    if not chunk:
+                        break
+                    f.write(chunk)
+                    hasher.update(chunk)
+            if expected_sha:
+                actual = hasher.hexdigest().lower()
+                if actual != expected_sha:
+                    raise ValueError("Checksum update non valida (SHA256 mismatch).")
+            return tmp_path
+        except Exception:
+            try:
+                if os.path.exists(tmp_path):
+                    os.remove(tmp_path)
+            except Exception:
+                pass
+            raise
+
+    def _open_update_page(self):
+        info = self._update_info or {}
+        page_url = str(info.get("page_url") or info.get("url") or "").strip()
+        if not page_url:
+            self.notify_err(self._tr("URL update non disponibile.", "Update URL not available."))
+            return
+        QDesktopServices.openUrl(QUrl(page_url))
+
+    def on_update_apply_clicked(self):
+        info = self._update_info or {}
+        if not bool(info.get("available")):
+            self.notify_err(self._tr("Nessun aggiornamento disponibile.", "No updates available."))
+            return
+
+        is_win_frozen = platform.system() == "Windows" and bool(getattr(sys, "frozen", False))
+        if not is_win_frozen:
+            self._open_update_page()
+            self.set_status(self._tr("Aperta pagina aggiornamento.", "Update page opened."))
+            return
+
+        if self._update_download_path and os.path.exists(self._update_download_path):
+            self._apply_windows_update_and_restart(self._update_download_path)
+            return
+
+        self.btn_settings_update_apply.setEnabled(False)
+        self.set_status(self._tr("Download aggiornamento in corso...", "Downloading update..."))
+        w = Worker(self._download_update_worker, dict(info))
+        w.ok.connect(self._on_update_download_ok)
+        w.err.connect(self._on_update_download_err)
+        self._workers.append(w)
+        w.start()
+
+    def _on_update_download_ok(self, path: str):
+        self._update_download_path = str(path or "").strip()
+        if not self._update_download_path:
+            self._on_update_download_err("download-path-empty")
+            return
+        self._apply_windows_update_and_restart(self._update_download_path)
+
+    def _on_update_download_err(self, msg: str):
+        self.btn_settings_update_apply.setEnabled(True)
+        self.notify_err(self._tr(f"Download update fallito: {msg}", f"Update download failed: {msg}"))
+        self.set_status(self._tr("Download aggiornamento fallito.", "Update download failed."))
+
+    def _apply_windows_update_and_restart(self, downloaded_exe: str):
+        if not (platform.system() == "Windows" and bool(getattr(sys, "frozen", False))):
+            self._open_update_page()
+            return
+        current_exe = os.path.abspath(sys.executable)
+        src = os.path.abspath(downloaded_exe)
+        if not os.path.exists(src):
+            self.notify_err(self._tr("File update mancante.", "Update file missing."))
+            return
+        bat_path = os.path.join(tempfile.gettempdir(), f"anigui_updater_{int(time.time())}.bat")
+        bat = (
+            "@echo off\n"
+            "setlocal\n"
+            f"set \"SRC={src}\"\n"
+            f"set \"DST={current_exe}\"\n"
+            "ping 127.0.0.1 -n 3 > nul\n"
+            "copy /Y \"%SRC%\" \"%DST%\" > nul\n"
+            "if errorlevel 1 (\n"
+            "  ping 127.0.0.1 -n 3 > nul\n"
+            "  copy /Y \"%SRC%\" \"%DST%\" > nul\n"
+            ")\n"
+            "start \"\" \"%DST%\"\n"
+            "del \"%SRC%\" > nul 2>&1\n"
+            "del \"%~f0\" > nul 2>&1\n"
+        )
+        with open(bat_path, "w", encoding="utf-8", newline="\n") as f:
+            f.write(bat)
+        self.set_status(self._tr("Riavvio per applicare update...", "Restarting to apply update..."))
+        try:
+            subprocess.Popen(["cmd", "/c", bat_path], cwd=os.path.dirname(current_exe))
+        except Exception as ex:
+            self.notify_err(self._tr(f"Avvio updater fallito: {ex}", f"Updater launch failed: {ex}"))
+            return
+        QApplication.instance().quit()
 
     def _load_favorites(self):
         try:
