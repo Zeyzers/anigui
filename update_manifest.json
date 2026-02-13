@@ -1,12 +1,12 @@
 {
-    "version":  "1.0.0",
+    "version":  "1.0.1",
     "windows":  {
-                    "url":  "https://github.com/Zeyzers/anigui/releases/download/v1.0.0/AniguiApp.exe",
-                    "sha256":  "55e7c5df813b7176fa409f89aac781dc7c21a52af417708f74b3765c4e2a6d3e"
+                    "url":  "https://github.com/Zeyzers/anigui/releases/download/v1.0.1/AniguiApp.exe",
+                    "sha256":  "79cf1f3db74d2154080318323d6c88368790c295c3783fe1c8b62d2016c063a3"
                 },
     "linux":  {
                   "url":  "https://raw.githubusercontent.com/Zeyzers/anigui/main/app.py",
-                  "sha256":  "98eeaa95643208852d865f9160171e9402a88174b3aec7a474625010e9e2ef02"
+                  "sha256":  "6e5cbf23c7bc5610c57591ba3be8c5ddc85b2ad06f48d961cf91975b506e534d"
               },
     "page_url":  "https://github.com/Zeyzers/anigui/releases/latest",
     "notes":  "Fixed Update URL"

@@ -96,7 +96,7 @@ OFFLINE_COVERS_MAP_PATH = os.path.join(app_state_dir(), "offline_covers.json")
 SETTINGS_PATH = os.path.join(app_state_dir(), "settings.json")
 FAVORITES_PATH = os.path.join(app_state_dir(), "favorites.json")
 METADATA_CACHE_PATH = os.path.join(app_state_dir(), "metadata_cache.json")
-APP_VERSION = "0.1.0"
+APP_VERSION = "1.0.1"
 UPDATE_MANIFEST_URL = os.getenv(
     "ANIGUI_UPDATE_MANIFEST_URL",
     "https://raw.githubusercontent.com/Zeyzers/anigui/main/update_manifest.json",
