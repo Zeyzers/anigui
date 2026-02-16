@@ -1,0 +1,3891 @@
+from __future__ import annotations
+
+import json
+import os
+import sys
+import time
+import shutil
+import warnings
+import socket
+import tempfile
+import platform
+import subprocess
+import urllib.request
+import urllib.error
+from urllib.parse import quote_plus, parse_qs, urlsplit
+import hashlib
+import importlib
+import re
+import zipfile
+from dataclasses import asdict
+from typing import Optional, Any, Callable
+import errno
+import threading
+from PySide6.QtCore import Qt, QThread, Signal, QTimer, QEvent, QSize, QByteArray, QBuffer, QPropertyAnimation, QUrl, QProcess
+from PySide6.QtGui import QShortcut, QKeySequence, QPixmap, QIcon, QColor, QPainter, QCursor, QImage, QDesktopServices
+from PySide6.QtWidgets import (
+    QApplication,
+    QWidget,
+    QMainWindow,
+    QVBoxLayout,
+    QHBoxLayout,
+    QLineEdit,
+    QPushButton,
+    QListWidget,
+    QStackedWidget,
+    QLabel,
+    QSplitter,
+    QMessageBox,
+    QComboBox,
+    QTabWidget,
+    QSlider,
+    QStyle,
+    QGroupBox,
+    QListWidgetItem,
+    QListView,
+    QFrame,
+    QProgressBar,
+    QGraphicsOpacityEffect,
+    QAbstractItemView,
+    QFileDialog,
+    QSizePolicy,
+)
+from urllib3.exceptions import InsecureRequestWarning
+
+from anipy_api.provider import get_provider, LanguageTypeEnum
+from anipy_api.anime import Anime
+from components import (
+    SearchItem,
+    OfflineAnimeItem,
+    FavoriteEntry,
+    StreamResult,
+    Worker,
+    DownloadTask,
+    DownloadWorker,
+    PlayerBase,
+    FullscreenPlayerWindow,
+    MiniPlayerWindow,
+    create_player_widget,
+)
+from models import (
+    app_state_dir,
+    HISTORY_PATH,
+    SEARCH_HISTORY_PATH,
+    OFFLINE_COVERS_MAP_PATH,
+    SETTINGS_PATH,
+    FAVORITES_PATH,
+    METADATA_CACHE_PATH,
+    HistoryEntry,
+    HistoryStore,
+)
+from services import APP_VERSION, UPDATE_MANIFEST_URL, UpdateService
+from download_mixin import DownloadMixin
+from update_mixin import UpdateMixin
+from history_mixin import HistoryMixin
+from search_mixin import SearchMixin
+from player_mixin import PlayerMixin
+
+# Suppress known noisy warning from upstream provider calls that use unverified TLS
+# for api.allanime.day. Keep other TLS warnings untouched.
+warnings.filterwarnings(
+    "ignore",
+    message=r"Unverified HTTPS request is being made to host 'api\.allanime\.day'.*",
+    category=InsecureRequestWarning,
+)
+
+
+def debug_log(msg: str) -> None:
+    ts = time.strftime("%H:%M:%S")
+    ms = int((time.time() % 1) * 1000)
+    thread_name = threading.current_thread().name
+    print(f"[anigui {ts}.{ms:03d}] [{thread_name}] {msg}", flush=True)
+
+# ---------------------------
+# Main App
+# ---------------------------
+class MainWindow(PlayerMixin, SearchMixin, DownloadMixin, UpdateMixin, HistoryMixin, QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("Anigui")
+        self.resize(1300, 780)
+
+        self._init_settings_and_runtime()
+        self._build_search_and_player_ui()
+        self._build_recommended_tab()
+        self._build_downloads_tab()
+        self._build_offline_tab()
+        self._build_favorites_tab()
+        self._build_settings_tab()
+        self._build_history_tab()
+        self._build_status_bar()
+        self._init_runtime_fields()
+        self._init_timers()
+        self._finish_startup()
+
+    def _init_settings_and_runtime(self):
+        self._settings = self._load_settings()
+        self.provider_name = str(self._settings.get("default_provider", "allanime"))
+        if self.provider_name not in ("allanime", "aw_animeworld", "aw_animeunity"):
+            self.provider_name = "allanime"
+        lang_s = str(self._settings.get("default_lang", "SUB")).upper()
+        self.lang = LanguageTypeEnum.DUB if lang_s == "DUB" else LanguageTypeEnum.SUB
+        self.quality = str(self._settings.get("default_quality", "best"))
+        if self.quality not in ("best", "worst", "360", "480", "720", "1080"):
+            self.quality = "best"
+        try:
+            self._startup_parallel_downloads = int(self._settings.get("parallel_downloads", 2))
+        except Exception:
+            self._startup_parallel_downloads = 2
+        self._startup_parallel_downloads = max(1, min(4, self._startup_parallel_downloads))
+        self._scheduler_enabled = bool(self._settings.get("scheduler_enabled", False))
+        self._scheduler_start = str(self._settings.get("scheduler_start", "00:00"))
+        self._scheduler_end = str(self._settings.get("scheduler_end", "23:59"))
+        try:
+            self._integrity_min_mb = float(self._settings.get("integrity_min_mb", 2.0))
+        except Exception:
+            self._integrity_min_mb = 2.0
+        self._integrity_min_mb = max(0.0, self._integrity_min_mb)
+        try:
+            self._integrity_retry_count = int(self._settings.get("integrity_retry_count", 1))
+        except Exception:
+            self._integrity_retry_count = 1
+        self._integrity_retry_count = max(0, min(5, self._integrity_retry_count))
+        self._anilist_enabled = bool(self._settings.get("anilist_enabled", False))
+        self._anilist_token = str(self._settings.get("anilist_token", "")).strip()
+        self.app_language = str(self._settings.get("app_language", "it")).strip().lower()
+        if self.app_language not in ("it", "en"):
+            self.app_language = "it"
+        self._incognito_enabled = False
+
+        self.selected_anime: Optional[Any] = None
+        self.selected_search_item: Optional[SearchItem] = None
+        self.episodes_list: list[float | int] = []
+        self.current_ep: float | int | None = None
+        self._aw_provider_instances: dict[str, Any] = {}
+        self._aw_anime_cls: Any = None
+        self._aw_config_ready = False
+        self._aw_runtime_ready = False
+        self._aw_cover_url_cache: dict[str, str | None] = {}
+        self._aw_cover_miss_until: dict[str, float] = {}
+
+        self.history = HistoryStore(HISTORY_PATH)
+        self.cover_cache_dir = os.path.join(app_state_dir(), "covers")
+        os.makedirs(self.cover_cache_dir, exist_ok=True)
+        dl_dir = str(self._settings.get("download_dir", "")).strip()
+        if dl_dir:
+            self.download_dir = os.path.abspath(os.path.expanduser(dl_dir))
+        else:
+            self.download_dir = os.path.join(app_state_dir(), "downloads")
+        os.makedirs(self.download_dir, exist_ok=True)
+
+    def _build_search_and_player_ui(self):
+        root = QWidget()
+        self.setCentralWidget(root)
+        outer = QVBoxLayout(root)
+        self._outer_layout = outer
+        outer.setContentsMargins(10, 10, 10, 10)
+        outer.setSpacing(10)
+
+        QShortcut(QKeySequence("F"), self, activated=self.toggle_fullscreen)
+        QShortcut(
+            QKeySequence("Escape"),
+            self,
+            activated=lambda: self._exit_video_fullscreen() if self._is_video_fullscreen() else None,
+        )
+
+        # top bar
+        top = QHBoxLayout()
+        top.setSpacing(8)
+        outer.addLayout(top)
+
+        self.search_input = QLineEdit()
+        self.search_input.setPlaceholderText("Cerca anime…")
+        self.search_input.returnPressed.connect(self.on_search)
+        self.search_input.textChanged.connect(self.on_search_text_changed)
+        top.addWidget(self.search_input, 1)
+
+        self.btn_search = QPushButton("🔎 Cerca")
+        self.btn_search.clicked.connect(self.on_search)
+        self.btn_search.setToolTip("Avvia ricerca anime")
+        top.addWidget(self.btn_search)
+
+        self.provider_combo = QComboBox()
+        self.provider_combo.addItem("AllAnime", "allanime")
+        self.provider_combo.addItem("AnimeWorld ITA", "aw_animeworld")
+        self.provider_combo.addItem("AnimeUnity ITA", "aw_animeunity")
+        self.provider_combo.currentIndexChanged.connect(self.on_provider_change)
+        top.addWidget(self.provider_combo)
+
+        self.lang_combo = QComboBox()
+        self.lang_combo.addItem("SUB", LanguageTypeEnum.SUB)
+        self.lang_combo.addItem("DUB", LanguageTypeEnum.DUB)
+        self.lang_combo.currentIndexChanged.connect(self.on_lang_change)
+        top.addWidget(self.lang_combo)
+
+        self.quality_combo = QComboBox()
+        for q in ["best", "worst", "360", "480", "720", "1080"]:
+            self.quality_combo.addItem(q)
+        self.quality_combo.currentIndexChanged.connect(self.on_quality_change)
+        top.addWidget(self.quality_combo)
+
+        self.provider_combo.blockSignals(True)
+        self.lang_combo.blockSignals(True)
+        self.quality_combo.blockSignals(True)
+        pidx = self.provider_combo.findData(self.provider_name)
+        if pidx >= 0:
+            self.provider_combo.setCurrentIndex(pidx)
+        self.lang_combo.setCurrentIndex(1 if self.lang == LanguageTypeEnum.DUB else 0)
+        qidx = self.quality_combo.findText(self.quality)
+        if qidx >= 0:
+            self.quality_combo.setCurrentIndex(qidx)
+        self.provider_combo.blockSignals(False)
+        self.lang_combo.blockSignals(False)
+        self.quality_combo.blockSignals(False)
+        self._apply_provider_ui_state()
+
+        self.lbl_spinner = QLabel("")
+        self.lbl_spinner.setFixedWidth(24)
+        top.addWidget(self.lbl_spinner)
+
+        self.btn_incognito = QPushButton("Incognito OFF")
+        self.btn_incognito.setCheckable(True)
+        self.btn_incognito.toggled.connect(self.on_toggle_incognito)
+        self.btn_incognito.setToolTip("Disabilita salvataggi locali e cache")
+        top.addWidget(self.btn_incognito)
+        self.lbl_incognito_badge = QLabel("INCOGNITO")
+        self.lbl_incognito_badge.setObjectName("incognitoBadge")
+        self.lbl_incognito_badge.setVisible(False)
+        top.addWidget(self.lbl_incognito_badge)
+
+        # tabs: Search / History
+        self.tabs = QTabWidget()
+        outer.addWidget(self.tabs, 1)
+
+        # ---- Search tab ----
+        self.tab_search = QWidget()
+        self.tabs.addTab(self.tab_search, "Search")
+        search_layout = QVBoxLayout(self.tab_search)
+
+        self.suggestions_panel = QWidget()
+        self.suggestions_panel.setObjectName("suggestionsPanel")
+        self.suggestions_panel.setSizePolicy(
+            QSizePolicy.Policy.Expanding,
+            QSizePolicy.Policy.Expanding,
+        )
+        sugg_layout = QVBoxLayout(self.suggestions_panel)
+        sugg_layout.setContentsMargins(0, 0, 0, 0)
+        self.lbl_suggestions = QLabel("Suggerimenti")
+        self.lbl_suggestions.setObjectName("sectionTitle")
+        sugg_layout.addWidget(self.lbl_suggestions)
+
+        sugg_row = QHBoxLayout()
+        self.list_recent_queries = QListWidget()
+        self.list_recent_queries.setObjectName("suggestionsList")
+        self.list_recent_queries.itemClicked.connect(self.on_pick_recent_query)
+        self.list_recent_queries.setVerticalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)
+        self.list_recent_queries.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        self.list_recent_queries.setSizePolicy(
+            QSizePolicy.Policy.Expanding,
+            QSizePolicy.Policy.Expanding,
+        )
+        sugg_row.addWidget(self.list_recent_queries, 1)
+
+        sugg_actions = QHBoxLayout()
+        self.btn_clear_search_history = QPushButton("🧹 Clear search history")
+        self.btn_clear_search_history.clicked.connect(self.on_clear_search_history)
+        sugg_actions.addStretch(1)
+        sugg_actions.addWidget(self.btn_clear_search_history)
+        sugg_layout.addLayout(sugg_actions)
+
+        sugg_layout.addLayout(sugg_row, 1)
+        search_layout.addWidget(self.suggestions_panel)
+
+        self.search_stack = QStackedWidget()
+        search_layout.addWidget(self.search_stack, 1)
+
+        # catalog page (full tab)
+        self.page_catalog = QWidget()
+        cat_layout = QVBoxLayout(self.page_catalog)
+        cat_layout.setContentsMargins(0, 0, 0, 0)
+        self.lbl_search_meta = QLabel("")
+        self.lbl_search_meta.setObjectName("sectionTitle")
+        self.lbl_search_meta.setVisible(False)
+        cat_layout.addWidget(self.lbl_search_meta)
+        self.lbl_search_state = QLabel("")
+        self.lbl_search_state.setObjectName("mutedLabel")
+        self.lbl_search_state.setAlignment(Qt.AlignmentFlag.AlignHCenter)
+        self.lbl_search_state.setVisible(False)
+        cat_layout.addWidget(self.lbl_search_state)
+
+        filters_row = QHBoxLayout()
+        self.combo_sort = QComboBox()
+        self.combo_sort.addItems(["Rilevanza", "Titolo A→Z", "Titolo Z→A"])
+        self.combo_sort.currentIndexChanged.connect(self.on_filters_changed)
+        filters_row.addWidget(self.combo_sort)
+
+        self.combo_season = QComboBox()
+        self.combo_season.addItems(["Stagione: Qualsiasi", "Winter", "Spring", "Summer", "Fall"])
+        self.combo_season.currentIndexChanged.connect(self.on_filters_changed)
+        filters_row.addWidget(self.combo_season)
+
+        self.combo_year = QComboBox()
+        self.combo_year.addItem("Anno: Qualsiasi")
+        current_year = time.localtime().tm_year
+        for y in range(current_year, current_year - 25, -1):
+            self.combo_year.addItem(str(y))
+        self.combo_year.currentIndexChanged.connect(self.on_filters_changed)
+        filters_row.addWidget(self.combo_year)
+
+        self.input_studio = QLineEdit()
+        self.input_studio.setPlaceholderText("Studio")
+        self.input_studio.textChanged.connect(self.on_filters_changed)
+        filters_row.addWidget(self.input_studio)
+
+        self.combo_rating = QComboBox()
+        self.combo_rating.addItems(["Rating: Qualsiasi", ">= 9", ">= 8", ">= 7", ">= 6"])
+        self.combo_rating.currentIndexChanged.connect(self.on_filters_changed)
+        filters_row.addWidget(self.combo_rating)
+        self._search_filter_widgets = [
+            self.combo_sort,
+            self.combo_season,
+            self.combo_year,
+            self.input_studio,
+            self.combo_rating,
+        ]
+
+        cat_layout.addLayout(filters_row)
+
+        self.results = QListWidget()
+        self.results.itemClicked.connect(self.on_pick_result)
+        self.results.setViewMode(QListView.ViewMode.IconMode)
+        self.results.setResizeMode(QListView.ResizeMode.Adjust)
+        self.results.setMovement(QListView.Movement.Static)
+        self.results.setWrapping(True)
+        self.results.setSpacing(14)
+        self.results.setIconSize(QSize(150, 220))
+        self.results.setWordWrap(True)
+        cat_layout.addWidget(self.results, 1)
+
+        self.search_stack.addWidget(self.page_catalog)
+
+        # anime page (episodes list only)
+        self.page_anime = QWidget()
+        anime_layout = QVBoxLayout(self.page_anime)
+        anime_layout.setContentsMargins(0, 0, 0, 0)
+
+        anime_header = QHBoxLayout()
+        self.btn_back_catalog = QPushButton("← Back to Search")
+        self.btn_back_catalog.clicked.connect(self.on_back_to_catalog)
+        anime_header.addWidget(self.btn_back_catalog, 0)
+        self.lbl_anime_title = QLabel("Anime")
+        self.lbl_anime_title.setStyleSheet("font-size: 18px; font-weight: 600;")
+        anime_header.addWidget(self.lbl_anime_title, 1)
+        self.btn_queue_selected_eps = QPushButton("⬇ Queue selected")
+        self.btn_queue_selected_eps.clicked.connect(self.on_download_add_selected_episodes)
+        anime_header.addWidget(self.btn_queue_selected_eps, 0)
+        self.btn_fav_anime = QPushButton("❤ Favorite")
+        self.btn_fav_anime.clicked.connect(self.on_favorite_add_current)
+        anime_header.addWidget(self.btn_fav_anime, 0)
+        anime_layout.addLayout(anime_header)
+
+        self.episodes = QListWidget()
+        self.episodes.itemDoubleClicked.connect(self.on_play_selected_episode)
+        self.episodes.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
+        self.episodes.setSpacing(8)
+        anime_layout.addWidget(QLabel("Episodi"), 0)
+        anime_layout.addWidget(self.episodes, 1)
+        self.search_stack.addWidget(self.page_anime)
+
+        # player page (full area)
+        self.page_player = QWidget()
+        player_page_layout = QVBoxLayout(self.page_player)
+        player_page_layout.setContentsMargins(0, 0, 0, 0)
+        player_page_layout.setSpacing(8)
+
+        player_header = QHBoxLayout()
+        self.btn_back_episodes = QPushButton("← Back to Episodes")
+        self.btn_back_episodes.clicked.connect(self.on_back_to_episodes)
+        player_header.addWidget(self.btn_back_episodes, 0)
+        self.lbl_player_title = QLabel("Player")
+        self.lbl_player_title.setStyleSheet("font-size: 18px; font-weight: 600;")
+        player_header.addWidget(self.lbl_player_title, 1)
+        player_page_layout.addLayout(player_header)
+
+        self.player_section = QWidget()
+        player_section_layout = QVBoxLayout(self.player_section)
+        player_section_layout.setContentsMargins(0, 0, 0, 0)
+        player_section_layout.setSpacing(8)
+
+        self.player = create_player_widget()
+        self.player_host = QWidget()
+        self.player_host_layout = QVBoxLayout(self.player_host)
+        self.player_host_layout.setContentsMargins(0, 0, 0, 0)
+        self.player_host_layout.setSpacing(0)
+        self.player_host_layout.addWidget(self.player, 1)
+        player_section_layout.addWidget(self.player_host, 1)
+
+        # controls group
+        controls = QGroupBox("Controls")
+        c = QVBoxLayout(controls)
+
+        row1 = QHBoxLayout()
+
+        self.btn_prev = QPushButton("⏮ Prev")
+        self.btn_prev.clicked.connect(self.on_prev_episode)
+        row1.addWidget(self.btn_prev)
+
+        self.btn_playpause = QPushButton("⏯ Play/Pause")
+        self.btn_playpause.clicked.connect(self.on_toggle_pause)
+        row1.addWidget(self.btn_playpause)
+
+        self.btn_next = QPushButton("⏭ Next")
+        self.btn_next.clicked.connect(self.on_next_episode)
+        row1.addWidget(self.btn_next)
+
+        self.btn_fs = QPushButton("⛶ Fullscreen")
+        self.btn_fs.clicked.connect(self.toggle_fullscreen)
+        row1.addWidget(self.btn_fs)
+
+        self.btn_mini = QPushButton("▣ Mini")
+        self.btn_mini.clicked.connect(self.toggle_mini_player)
+        row1.addWidget(self.btn_mini)
+
+        c.addLayout(row1)
+
+        # seek slider + labels
+        row2 = QHBoxLayout()
+        self.lbl_time = QLabel("00:00 / 00:00")
+        row2.addWidget(self.lbl_time)
+
+        self.seek_slider = QSlider(Qt.Orientation.Horizontal)
+        self.seek_slider.setRange(0, 1000)
+        self.seek_slider.sliderPressed.connect(self._on_seek_pressed)
+        self.seek_slider.sliderReleased.connect(self._on_seek_released)
+        row2.addWidget(self.seek_slider, 1)
+        self._resume_marker = QFrame(self.seek_slider)
+        self._resume_marker.setFixedWidth(2)
+        self._resume_marker.setStyleSheet("background: #e50914;")
+        self._resume_marker.hide()
+        self._resume_marker_pos: float | None = None
+        self.seek_slider.installEventFilter(self)
+        c.addLayout(row2)
+
+        # volume
+        row3 = QHBoxLayout()
+        row3.addWidget(QLabel("Volume"))
+        self.vol_slider = QSlider(Qt.Orientation.Horizontal)
+        self.vol_slider.setRange(0, 130)
+        self.vol_slider.setValue(100)
+        self.vol_slider.valueChanged.connect(self.on_volume_changed)
+        row3.addWidget(self.vol_slider, 1)
+        c.addLayout(row3)
+
+        player_section_layout.addWidget(controls, 0)
+        player_page_layout.addWidget(self.player_section, 1)
+        self.search_stack.addWidget(self.page_player)
+        self.search_stack.setCurrentWidget(self.page_catalog)
+
+    def _build_recommended_tab(self):
+        # ---- Recommended tab ----
+        self.tab_recommended = QWidget()
+        self.tabs.addTab(self.tab_recommended, "Recommended")
+        rec_layout = QVBoxLayout(self.tab_recommended)
+
+        rec_top = QHBoxLayout()
+        self.lbl_recommended = QLabel("Recent Releases + Recommended")
+        rec_top.addWidget(self.lbl_recommended, 1)
+        self.btn_refresh_recommended = QPushButton("↻ Aggiorna")
+        self.btn_refresh_recommended.clicked.connect(self.on_refresh_recommended)
+        rec_top.addWidget(self.btn_refresh_recommended, 0)
+        rec_layout.addLayout(rec_top)
+
+        rec_split = QSplitter(Qt.Orientation.Horizontal)
+        rec_layout.addWidget(rec_split, 1)
+
+        recent_col = QWidget()
+        recent_col_layout = QVBoxLayout(recent_col)
+        recent_col_layout.setContentsMargins(0, 0, 0, 0)
+        self.lbl_recent_header = QLabel("Recent Releases")
+        self.lbl_recent_header.setObjectName("recentHeader")
+        recent_col_layout.addWidget(self.lbl_recent_header)
+
+        self.recent = QListWidget()
+        self.recent.itemClicked.connect(self.on_pick_recent)
+        self.recent.setViewMode(QListView.ViewMode.IconMode)
+        self.recent.setResizeMode(QListView.ResizeMode.Adjust)
+        self.recent.setMovement(QListView.Movement.Static)
+        self.recent.setWrapping(True)
+        self.recent.setSpacing(14)
+        self.recent.setIconSize(QSize(150, 220))
+        self.recent.setWordWrap(True)
+        recent_col_layout.addWidget(self.recent, 1)
+        rec_split.addWidget(recent_col)
+
+        recommended_col = QWidget()
+        recommended_col_layout = QVBoxLayout(recommended_col)
+        recommended_col_layout.setContentsMargins(0, 0, 0, 0)
+        self.lbl_recommended_header = QLabel("Recommended")
+        self.lbl_recommended_header.setObjectName("recommendedHeader")
+        recommended_col_layout.addWidget(self.lbl_recommended_header)
+
+        self.recommended = QListWidget()
+        self.recommended.itemClicked.connect(self.on_pick_recommended)
+        self.recommended.setViewMode(QListView.ViewMode.IconMode)
+        self.recommended.setResizeMode(QListView.ResizeMode.Adjust)
+        self.recommended.setMovement(QListView.Movement.Static)
+        self.recommended.setWrapping(True)
+        self.recommended.setSpacing(14)
+        self.recommended.setIconSize(QSize(150, 220))
+        self.recommended.setWordWrap(True)
+        recommended_col_layout.addWidget(self.recommended, 1)
+        rec_split.addWidget(recommended_col)
+        rec_split.setStretchFactor(0, 1)
+        rec_split.setStretchFactor(1, 1)
+
+    def _build_downloads_tab(self):
+        # ---- Downloads tab ----
+        self.tab_downloads = QWidget()
+        self.tabs.addTab(self.tab_downloads, "Downloads")
+        dl_layout = QVBoxLayout(self.tab_downloads)
+
+        dl_top = QHBoxLayout()
+        self.btn_dl_add_current = QPushButton("＋ Aggiungi episodio corrente")
+        self.btn_dl_add_current.clicked.connect(self.on_download_add_current)
+        dl_top.addWidget(self.btn_dl_add_current)
+
+        self.btn_dl_start = QPushButton("▶ Avvia coda")
+        self.btn_dl_start.clicked.connect(self.on_download_start_queue)
+        self.btn_dl_start.setToolTip("Avvia i download in coda")
+        dl_top.addWidget(self.btn_dl_start)
+
+        self.combo_dl_parallel = QComboBox()
+        self.combo_dl_parallel.addItem("Parallel x1", 1)
+        self.combo_dl_parallel.addItem("Parallel x2", 2)
+        self.combo_dl_parallel.addItem("Parallel x3", 3)
+        self.combo_dl_parallel.addItem("Parallel x4", 4)
+        self.combo_dl_parallel.setCurrentIndex(self._startup_parallel_downloads - 1)
+        self.combo_dl_parallel.currentIndexChanged.connect(self.on_download_parallel_change)
+        dl_top.addWidget(self.combo_dl_parallel)
+
+        self.btn_dl_cancel = QPushButton("✖ Annulla selezionato")
+        self.btn_dl_cancel.clicked.connect(self.on_download_cancel_selected)
+        dl_top.addWidget(self.btn_dl_cancel)
+
+        self.btn_dl_clear = QPushButton("🧹 Pulisci completati")
+        self.btn_dl_clear.clicked.connect(self.on_download_clear_completed)
+        dl_top.addWidget(self.btn_dl_clear)
+
+        self.btn_dl_open = QPushButton("📂 Open folder")
+        self.btn_dl_open.clicked.connect(self.on_download_open_folder)
+        dl_top.addWidget(self.btn_dl_open)
+        dl_layout.addLayout(dl_top)
+
+        self.downloads_list = QListWidget()
+        dl_layout.addWidget(self.downloads_list, 1)
+
+    def _build_offline_tab(self):
+        # ---- Offline tab ----
+        self.tab_offline = QWidget()
+        self.tabs.addTab(self.tab_offline, "Offline")
+        off_layout = QVBoxLayout(self.tab_offline)
+
+        off_top = QHBoxLayout()
+        self.lbl_offline = QLabel("Anime scaricati (stream locale)")
+        off_top.addWidget(self.lbl_offline, 1)
+        self.btn_offline_refresh = QPushButton("↻ Aggiorna")
+        self.btn_offline_refresh.clicked.connect(self.refresh_offline_library)
+        off_top.addWidget(self.btn_offline_refresh, 0)
+        self.btn_offline_open = QPushButton("📂 Open downloads")
+        self.btn_offline_open.clicked.connect(self.on_download_open_folder)
+        off_top.addWidget(self.btn_offline_open, 0)
+        off_layout.addLayout(off_top)
+
+        self.offline_stack = QStackedWidget()
+        off_layout.addWidget(self.offline_stack, 1)
+
+        self.page_offline_catalog = QWidget()
+        off_cat_layout = QVBoxLayout(self.page_offline_catalog)
+        off_cat_layout.setContentsMargins(0, 0, 0, 0)
+        off_cat_layout.addWidget(QLabel("Catalogo Offline"))
+        self.offline_results = QListWidget()
+        self.offline_results.itemClicked.connect(self.on_pick_offline_anime)
+        self.offline_results.setViewMode(QListView.ViewMode.IconMode)
+        self.offline_results.setResizeMode(QListView.ResizeMode.Adjust)
+        self.offline_results.setMovement(QListView.Movement.Static)
+        self.offline_results.setWrapping(True)
+        self.offline_results.setSpacing(14)
+        self.offline_results.setIconSize(QSize(150, 220))
+        self.offline_results.setWordWrap(True)
+        self.offline_results.setObjectName("resultsList")
+        off_cat_layout.addWidget(self.offline_results, 1)
+        self.offline_stack.addWidget(self.page_offline_catalog)
+
+        self.page_offline_anime = QWidget()
+        off_anime_layout = QVBoxLayout(self.page_offline_anime)
+        off_anime_layout.setContentsMargins(0, 0, 0, 0)
+        off_header = QHBoxLayout()
+        self.btn_offline_back = QPushButton("← Back to Offline Catalog")
+        self.btn_offline_back.clicked.connect(self.on_offline_back_to_catalog)
+        off_header.addWidget(self.btn_offline_back, 0)
+        self.lbl_offline_anime_title = QLabel("Anime")
+        off_header.addWidget(self.lbl_offline_anime_title, 1)
+        off_anime_layout.addLayout(off_header)
+        self.offline_episodes = QListWidget()
+        self.offline_episodes.itemDoubleClicked.connect(self.on_play_offline_episode)
+        self.offline_episodes.itemClicked.connect(self.on_play_offline_episode)
+        self.offline_episodes.setObjectName("episodesList")
+        off_anime_layout.addWidget(QLabel("Episodi / File"), 0)
+        off_anime_layout.addWidget(self.offline_episodes, 1)
+        self.offline_stack.addWidget(self.page_offline_anime)
+        self.offline_stack.setCurrentWidget(self.page_offline_catalog)
+
+    def _build_favorites_tab(self):
+        # ---- Favorites tab ----
+        self.tab_favorites = QWidget()
+        self.tabs.addTab(self.tab_favorites, "Favorites")
+        fav_layout = QVBoxLayout(self.tab_favorites)
+        fav_top = QHBoxLayout()
+        fav_top.addWidget(QLabel("Watchlist / Favorites"), 1)
+        self.btn_fav_add_current = QPushButton("❤ Add current anime")
+        self.btn_fav_add_current.clicked.connect(self.on_favorite_add_current)
+        fav_top.addWidget(self.btn_fav_add_current, 0)
+        self.btn_fav_remove = QPushButton("🗑 Remove selected")
+        self.btn_fav_remove.clicked.connect(self.on_favorite_remove_selected)
+        fav_top.addWidget(self.btn_fav_remove, 0)
+        fav_layout.addLayout(fav_top)
+        self.favorites_list = QListWidget()
+        self.favorites_list.itemClicked.connect(self.on_pick_favorite)
+        self.favorites_list.setViewMode(QListView.ViewMode.IconMode)
+        self.favorites_list.setResizeMode(QListView.ResizeMode.Adjust)
+        self.favorites_list.setMovement(QListView.Movement.Static)
+        self.favorites_list.setWrapping(True)
+        self.favorites_list.setSpacing(14)
+        self.favorites_list.setIconSize(QSize(150, 220))
+        self.favorites_list.setWordWrap(True)
+        self.favorites_list.setObjectName("resultsList")
+        fav_layout.addWidget(self.favorites_list, 1)
+
+    def _build_settings_tab(self):
+        # ---- Settings tab ----
+        self.tab_settings = QWidget()
+        self.tabs.addTab(self.tab_settings, "Settings")
+        settings_layout = QVBoxLayout(self.tab_settings)
+
+        row_dl = QHBoxLayout()
+        self.lbl_settings_download_dir = QLabel("Download directory")
+        row_dl.addWidget(self.lbl_settings_download_dir, 0)
+        self.input_settings_download_dir = QLineEdit(self.download_dir)
+        row_dl.addWidget(self.input_settings_download_dir, 1)
+        self.btn_settings_browse_download_dir = QPushButton("Sfoglia")
+        self.btn_settings_browse_download_dir.clicked.connect(self.on_settings_browse_download_dir)
+        row_dl.addWidget(self.btn_settings_browse_download_dir, 0)
+        settings_layout.addLayout(row_dl)
+
+        row_defaults = QHBoxLayout()
+        self.lbl_settings_default_provider = QLabel("Default provider")
+        row_defaults.addWidget(self.lbl_settings_default_provider, 0)
+        self.combo_settings_provider = QComboBox()
+        self.combo_settings_provider.addItem("AllAnime", "allanime")
+        self.combo_settings_provider.addItem("AnimeWorld ITA", "aw_animeworld")
+        self.combo_settings_provider.addItem("AnimeUnity ITA", "aw_animeunity")
+        row_defaults.addWidget(self.combo_settings_provider, 1)
+        self.lbl_settings_default_lang = QLabel("Default language")
+        row_defaults.addWidget(self.lbl_settings_default_lang, 0)
+        self.combo_settings_lang = QComboBox()
+        self.combo_settings_lang.addItem("SUB", "SUB")
+        self.combo_settings_lang.addItem("DUB", "DUB")
+        row_defaults.addWidget(self.combo_settings_lang, 1)
+        settings_layout.addLayout(row_defaults)
+
+        row_app_lang = QHBoxLayout()
+        self.lbl_settings_app_language = QLabel("App language")
+        row_app_lang.addWidget(self.lbl_settings_app_language, 0)
+        self.combo_settings_app_language = QComboBox()
+        self.combo_settings_app_language.addItem("Italiano", "it")
+        self.combo_settings_app_language.addItem("English", "en")
+        row_app_lang.addWidget(self.combo_settings_app_language, 1)
+        row_app_lang.addStretch(1)
+        settings_layout.addLayout(row_app_lang)
+
+        row_quality = QHBoxLayout()
+        self.lbl_settings_default_quality = QLabel("Default quality")
+        row_quality.addWidget(self.lbl_settings_default_quality, 0)
+        self.combo_settings_quality = QComboBox()
+        for q in ["best", "worst", "360", "480", "720", "1080"]:
+            self.combo_settings_quality.addItem(q, q)
+        row_quality.addWidget(self.combo_settings_quality, 1)
+        self.lbl_settings_parallel_downloads = QLabel("Parallel downloads")
+        row_quality.addWidget(self.lbl_settings_parallel_downloads, 0)
+        self.combo_settings_parallel = QComboBox()
+        self.combo_settings_parallel.addItem("1", 1)
+        self.combo_settings_parallel.addItem("2", 2)
+        self.combo_settings_parallel.addItem("3", 3)
+        self.combo_settings_parallel.addItem("4", 4)
+        row_quality.addWidget(self.combo_settings_parallel, 1)
+        settings_layout.addLayout(row_quality)
+
+        row_sched = QHBoxLayout()
+        self.lbl_settings_scheduler = QLabel("Scheduler")
+        row_sched.addWidget(self.lbl_settings_scheduler, 0)
+        self.combo_settings_scheduler_enabled = QComboBox()
+        self.combo_settings_scheduler_enabled.addItem("Disabled", False)
+        self.combo_settings_scheduler_enabled.addItem("Enabled", True)
+        row_sched.addWidget(self.combo_settings_scheduler_enabled, 1)
+        self.lbl_settings_scheduler_start = QLabel("Start HH:MM")
+        row_sched.addWidget(self.lbl_settings_scheduler_start, 0)
+        self.input_settings_scheduler_start = QLineEdit(self._scheduler_start)
+        self.input_settings_scheduler_start.setMaxLength(5)
+        row_sched.addWidget(self.input_settings_scheduler_start, 1)
+        self.lbl_settings_scheduler_end = QLabel("End HH:MM")
+        row_sched.addWidget(self.lbl_settings_scheduler_end, 0)
+        self.input_settings_scheduler_end = QLineEdit(self._scheduler_end)
+        self.input_settings_scheduler_end.setMaxLength(5)
+        row_sched.addWidget(self.input_settings_scheduler_end, 1)
+        settings_layout.addLayout(row_sched)
+
+        row_integrity = QHBoxLayout()
+        self.lbl_settings_integrity_min_mb = QLabel("Integrity min MB")
+        row_integrity.addWidget(self.lbl_settings_integrity_min_mb, 0)
+        self.input_settings_integrity_min_mb = QLineEdit(str(self._integrity_min_mb))
+        row_integrity.addWidget(self.input_settings_integrity_min_mb, 1)
+        self.lbl_settings_retry_count = QLabel("Retry count")
+        row_integrity.addWidget(self.lbl_settings_retry_count, 0)
+        self.combo_settings_integrity_retries = QComboBox()
+        for i in range(0, 6):
+            self.combo_settings_integrity_retries.addItem(str(i), i)
+        row_integrity.addWidget(self.combo_settings_integrity_retries, 1)
+        settings_layout.addLayout(row_integrity)
+
+        row_anilist = QHBoxLayout()
+        self.lbl_settings_anilist_sync = QLabel("AniList sync")
+        row_anilist.addWidget(self.lbl_settings_anilist_sync, 0)
+        self.combo_settings_anilist_enabled = QComboBox()
+        self.combo_settings_anilist_enabled.addItem("Disabled", False)
+        self.combo_settings_anilist_enabled.addItem("Enabled", True)
+        row_anilist.addWidget(self.combo_settings_anilist_enabled, 1)
+        self.lbl_settings_anilist_token = QLabel("AniList token")
+        row_anilist.addWidget(self.lbl_settings_anilist_token, 0)
+        self.input_settings_anilist_token = QLineEdit(self._anilist_token)
+        self.input_settings_anilist_token.setEchoMode(QLineEdit.EchoMode.Password)
+        self.input_settings_anilist_token.setPlaceholderText("Personal Access Token")
+        row_anilist.addWidget(self.input_settings_anilist_token, 2)
+        settings_layout.addLayout(row_anilist)
+
+        row_actions = QHBoxLayout()
+        self.btn_settings_save = QPushButton("Salva impostazioni")
+        self.btn_settings_save.clicked.connect(self.on_settings_save)
+        row_actions.addWidget(self.btn_settings_save, 0)
+        self.btn_settings_reset = QPushButton("Reset default")
+        self.btn_settings_reset.clicked.connect(self.on_settings_reset)
+        row_actions.addWidget(self.btn_settings_reset, 0)
+        self.btn_settings_backup = QPushButton("Backup")
+        self.btn_settings_backup.clicked.connect(self.on_settings_backup)
+        row_actions.addWidget(self.btn_settings_backup, 0)
+        self.btn_settings_restore = QPushButton("Restore")
+        self.btn_settings_restore.clicked.connect(self.on_settings_restore)
+        row_actions.addWidget(self.btn_settings_restore, 0)
+        self.btn_settings_anilist_test = QPushButton("Test connessione AniList")
+        self.btn_settings_anilist_test.clicked.connect(self.on_anilist_test_connection)
+        row_actions.addWidget(self.btn_settings_anilist_test, 0)
+        self.btn_settings_anilist_sync_now = QPushButton("Sync now")
+        self.btn_settings_anilist_sync_now.clicked.connect(self.on_anilist_sync_now)
+        self.btn_settings_anilist_sync_now.setToolTip("Invia subito il progresso corrente ad AniList")
+        row_actions.addWidget(self.btn_settings_anilist_sync_now, 0)
+        self.btn_settings_anilist_pull = QPushButton("Importa da AniList")
+        self.btn_settings_anilist_pull.clicked.connect(self.on_anilist_pull_from_remote)
+        self.btn_settings_anilist_pull.setToolTip("Importa watchlist/progressi da AniList")
+        row_actions.addWidget(self.btn_settings_anilist_pull, 0)
+        self.btn_settings_update_check = QPushButton("Check updates")
+        self.btn_settings_update_check.clicked.connect(self.on_update_check_clicked)
+        row_actions.addWidget(self.btn_settings_update_check, 0)
+        self.btn_settings_update_apply = QPushButton("Apply update")
+        self.btn_settings_update_apply.clicked.connect(self.on_update_apply_clicked)
+        self.btn_settings_update_apply.setEnabled(False)
+        row_actions.addWidget(self.btn_settings_update_apply, 0)
+        row_actions.addStretch(1)
+        settings_layout.addLayout(row_actions)
+        settings_layout.addStretch(1)
+
+    def _build_history_tab(self):
+        # ---- History tab ----
+        self.tab_history = QWidget()
+        self.tabs.addTab(self.tab_history, "Watchlist")
+        hist_layout = QVBoxLayout(self.tab_history)
+
+        hist_top = QHBoxLayout()
+        self.lbl_history_header = QLabel("Watchlist: Planned · Watching · Completed")
+        hist_top.addWidget(self.lbl_history_header, 1)
+        self.lbl_history_filter = QLabel("Filter")
+        hist_top.addWidget(self.lbl_history_filter, 0)
+        self.combo_history_filter = QComboBox()
+        self.combo_history_filter.addItem("All", "All")
+        self.combo_history_filter.addItem("Completed", "Completed")
+        self.combo_history_filter.addItem("Watching", "Watching")
+        self.combo_history_filter.addItem("Planned", "Planned")
+        self.combo_history_filter.currentIndexChanged.connect(self.on_history_filter_changed)
+        hist_top.addWidget(self.combo_history_filter, 0)
+        hist_layout.addLayout(hist_top)
+
+        self.hist_list = QListWidget()
+        self.hist_list.itemClicked.connect(self.on_pick_history)
+        self.hist_list.itemDoubleClicked.connect(self.on_history_open_details)
+        self.hist_list.setViewMode(QListView.ViewMode.IconMode)
+        self.hist_list.setResizeMode(QListView.ResizeMode.Adjust)
+        self.hist_list.setMovement(QListView.Movement.Static)
+        self.hist_list.setWrapping(True)
+        self.hist_list.setFlow(QListView.Flow.LeftToRight)
+        self.hist_list.setSpacing(8)
+        self.hist_list.setWordWrap(False)
+        self.hist_list.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.hist_list.setObjectName("continueList")
+        self.hist_list.verticalScrollBar().valueChanged.connect(self._position_history_section_overlays)
+        hist_layout.addWidget(self.hist_list, 1)
+
+        hist_buttons = QHBoxLayout()
+
+        self.btn_hist_resume = QPushButton("▶ Resume selected")
+        self.btn_hist_resume.clicked.connect(self.on_history_resume)
+        hist_buttons.addWidget(self.btn_hist_resume)
+
+
+        self.btn_hist_resume_next = QPushButton("⏭ Resume next")
+        self.btn_hist_resume_next.clicked.connect(self.on_history_resume_next)
+        hist_buttons.addWidget(self.btn_hist_resume_next)
+
+        self.btn_hist_mark_seen = QPushButton("✅ Mark as seen")
+        self.btn_hist_mark_seen.clicked.connect(self.on_history_mark_seen)
+        hist_buttons.addWidget(self.btn_hist_mark_seen)
+
+        self.btn_hist_delete = QPushButton("🗑 Remove")
+        self.btn_hist_delete.clicked.connect(self.on_history_delete)
+        hist_buttons.addWidget(self.btn_hist_delete)
+
+        hist_layout.addLayout(hist_buttons)
+
+        hist_clear = QHBoxLayout()
+        self.btn_clear_watch_history = QPushButton("🧹 Clear watch history")
+        self.btn_clear_watch_history.clicked.connect(self.on_clear_watch_history)
+        hist_clear.addWidget(self.btn_clear_watch_history)
+        hist_layout.addLayout(hist_clear)
+
+    def _build_status_bar(self):
+        # status
+        self.status = QLabel("Pronto.")
+        self.status.setObjectName("statusBar")
+        self._outer_layout.addWidget(self.status)
+
+    def _init_runtime_fields(self):
+        # internal
+        self._workers: list[Worker] = []
+        self._result_items: list[SearchItem] = []
+        self._history_items: list[HistoryEntry] = []
+        self._history_filter = "All"
+        self._history_seen_eps_for_ui: set[float] | None = None
+        self._history_episode_progress_for_ui: dict[float, dict[str, Any]] | None = None
+        self._history_cover_labels: dict[int, QLabel] = {}
+        self._history_section_overlays: dict[int, QWidget] = {}
+        self._update_info: dict[str, Any] | None = None
+        self._update_download_path: str | None = None
+        self._update_service = UpdateService(UPDATE_MANIFEST_URL, APP_VERSION)
+        self._search_cards: list[QListWidgetItem] = []
+        self._recent_items: list[SearchItem] = []
+        self._recent_cards: list[QListWidgetItem] = []
+        self._recommended_items: list[SearchItem] = []
+        self._recommended_cards: list[QListWidgetItem] = []
+        self._favorite_items: list[FavoriteEntry] = []
+        self._metadata_cache: dict[str, dict[str, Any]] = {}
+        self._download_tasks: dict[str, DownloadTask] = {}
+        self._download_order: list[str] = []
+        self._active_download_workers: dict[str, DownloadWorker] = {}
+        self._active_download_resolve_ids: set[str] = set()
+        self._max_parallel_downloads = self._startup_parallel_downloads
+        self._search_nonce = 0
+        self._recent_nonce = 0
+        self._recommended_nonce = 0
+        self._recommended_loaded = False
+        self._current_search_view = "catalog"
+        self._recent_queries: list[str] = []
+        self._offline_covers_map: dict[str, str] = {}
+        self._last_search_query: str | None = None
+        self._pending_search_query: str | None = None
+        self._search_debounce_timer = QTimer(self)
+        self._search_debounce_timer.setSingleShot(True)
+        self._search_debounce_timer.setInterval(350)
+        self._search_debounce_timer.timeout.connect(self._run_debounced_search)
+        self._filters_pending = False
+        self._enrich_nonce = 0
+        self._filtering_nonce = 0
+        self._result_items_raw: list[SearchItem] = []
+        self._requests_in_flight = 0
+        self._spinner_frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
+        self._spinner_idx = 0
+        self._spinner_timer = QTimer(self)
+        self._spinner_timer.setInterval(120)
+        self._spinner_timer.timeout.connect(self._spin_tick)
+        self._skeleton_phase = 0
+        self._skeleton_timer = QTimer(self)
+        self._skeleton_timer.setInterval(120)
+        self._skeleton_timer.timeout.connect(self._update_skeletons)
+        self._last_timeline_diag_at = 0.0
+        self._timeline_missing_logged = False
+        self._last_progress_save_at = 0.0
+        self._last_progress_pos = -1.0
+        self._last_progress_percent = -1.0
+        self._pending_resume_seek: float | None = None
+        self._pending_resume_seek_ratio: float | None = None
+        self._pending_resume_seek_attempts = 0
+        self._local_media_active = False
+        self._offline_items: list[OfflineAnimeItem] = []
+        self._offline_episode_files: list[str] = []
+        self._offline_current_anime_dir: str | None = None
+        self._offline_current_episode_index: int | None = None
+        self._offline_nonce = 0
+        self._anilist_media_id_cache: dict[str, int] = {}
+        self._anilist_last_sync_ts: dict[str, float] = {}
+        self._anilist_last_synced_progress: dict[str, int] = {}
+        self._mini_player_window: QWidget | None = None
+        self._video_fs_window: FullscreenPlayerWindow | None = None
+        self._video_fs_shortcuts: list[QShortcut] = []
+        self._closing_video_fs = False
+        self._fs_overlay: QWidget | None = None
+        self._fs_overlay_effect: QGraphicsOpacityEffect | None = None
+        self._fs_overlay_anim: QPropertyAnimation | None = None
+        self._fs_seek_slider: QSlider | None = None
+        self._fs_vol_slider: QSlider | None = None
+        self._fs_lbl_time: QLabel | None = None
+        self._fs_btn_playpause: QPushButton | None = None
+        self._fs_btn_prev: QPushButton | None = None
+        self._fs_btn_next: QPushButton | None = None
+        self._fs_btn_exit: QPushButton | None = None
+        self._fs_help_label: QLabel | None = None
+        self._fs_seeking = False
+        self._fs_hide_delay_ms = 2200
+        self._fs_autohide_timer = QTimer(self)
+        self._fs_autohide_timer.setSingleShot(True)
+        self._fs_autohide_timer.setInterval(self._fs_hide_delay_ms)
+        self._fs_autohide_timer.timeout.connect(self._fs_apply_hidden)
+        self._fs_last_cursor_pos = None
+        self._fs_mouse_poll_timer = QTimer(self)
+        self._fs_mouse_poll_timer.setInterval(120)
+        self._fs_mouse_poll_timer.timeout.connect(self._fs_poll_cursor)
+
+    def _init_timers(self):
+        # seek tracking
+        self._seeking = False
+
+        # timers for UI update
+        self.poll_timer = QTimer(self)
+        self.poll_timer.setInterval(500)
+        self.poll_timer.timeout.connect(self.poll_player)
+        self.poll_timer.start()
+        self.scheduler_timer = QTimer(self)
+        self.scheduler_timer.setInterval(30000)
+        self.scheduler_timer.timeout.connect(self._scheduler_tick)
+        self.scheduler_timer.start()
+
+    def _finish_startup(self):
+        self._apply_netflix_theme()
+        self._apply_app_language_ui()
+        self.recent.setObjectName("resultsList")
+        self.recommended.setObjectName("resultsList")
+        self.refresh_history_ui()
+        self.tabs.currentChanged.connect(self.on_tab_changed)
+
+        self._load_search_history()
+        self._load_offline_covers_map()
+        self._load_favorites()
+        self._load_metadata_cache()
+        self._sync_settings_ui_from_state()
+        self._refresh_recent_queries_ui()
+        self._update_suggestions_visibility()
+        self._refresh_search_layout()
+        self.refresh_offline_library()
+        self.refresh_favorites_ui()
+        QTimer.singleShot(1200, self.check_updates_silent)
+
+    # ---------------- UI helpers ----------------
+    def do_resolve_stream(
+        self,
+        anime: Any,
+        ep: float | int,
+        lang,
+        preferred_quality,
+        provider_name: str | None = None,
+    ) -> StreamResult:
+        provider_name = provider_name or self.provider_name
+        t0 = time.perf_counter()
+        debug_log(
+            f"Resolving stream start: anime={anime.name}, ep={ep}, "
+            f"lang={'SUB' if lang == LanguageTypeEnum.SUB else 'DUB'}, quality={preferred_quality}"
+        )
+        if self._is_aw_provider_name(provider_name):
+            provider = self._aw_provider(provider_name)
+            ep_key = str(int(ep)) if isinstance(ep, float) and ep.is_integer() else str(ep)
+            if hasattr(anime, "has_episode") and anime.has_episode(ep_key):
+                aw_ep = anime.episode(ep_key)
+            else:
+                aw_ep = anime.episode(str(ep))
+            url = provider.episode_link(anime, aw_ep)
+            debug_log(f"Resolving stream done in {time.perf_counter() - t0:.3f}s")
+            return StreamResult(url=url, referrer=None, sub_file=None)
+
+        stream = anime.get_video(
+            episode=ep,
+            lang=lang,
+            preferred_quality=preferred_quality,
+        )
+        url = getattr(stream, "url", None) or str(stream)
+        ref = getattr(stream, "referrer", None)
+        debug_log(f"Resolving stream done in {time.perf_counter() - t0:.3f}s")
+        return StreamResult(url=url, referrer=ref, sub_file=None)
+
+    def notify_err(self, msg: str):
+        title = self._tr("Errore", "Error")
+        QMessageBox.critical(self, title, self._localize_runtime_text(str(msg)))
+
+    def set_status(self, msg: str):
+        self.status.setText(self._localize_runtime_text(str(msg)))
+
+    def _tr(self, it: str, en: str) -> str:
+        return en if self.app_language == "en" else it
+
+    def _translate_literal(self, text: str) -> str:
+        if not text:
+            return text
+        pairs = [
+            ("Search", "Cerca"),
+            ("Recommended", "Consigliati"),
+            ("Downloads", "Download"),
+            ("Favorites", "Preferiti"),
+            ("Settings", "Impostazioni"),
+            ("Download directory", "Cartella download"),
+            ("Default provider", "Provider predefinito"),
+            ("Default language", "Lingua predefinita"),
+            ("App language", "Lingua app"),
+            ("Default quality", "Qualita predefinita"),
+            ("Parallel downloads", "Download paralleli"),
+            ("Start HH:MM", "Inizio HH:MM"),
+            ("End HH:MM", "Fine HH:MM"),
+            ("Retry count", "Numero retry"),
+            ("Browse", "Sfoglia"),
+            ("Save settings", "Salva impostazioni"),
+            ("Reset defaults", "Reset predefiniti"),
+            ("Restore", "Ripristina"),
+            ("Test AniList connection", "Test connessione AniList"),
+            ("Import from AniList", "Importa da AniList"),
+            ("Filter", "Filtro"),
+            ("All", "Tutti"),
+            ("Completed", "Completati"),
+            ("Watching", "In corso"),
+            ("Planned", "Da iniziare"),
+            ("Open folder", "Apri cartella"),
+            ("Open downloads", "Apri download"),
+            ("Back to Search", "Torna alla ricerca"),
+            ("Back to Episodes", "Torna agli episodi"),
+            ("Back to Offline Catalog", "Torna al catalogo offline"),
+            ("Queue selected", "Metti in coda selezionati"),
+            ("Favorite", "Preferito"),
+            ("Prev", "Precedente"),
+            ("Next", "Successivo"),
+            ("Fullscreen", "Schermo intero"),
+            ("Mini", "Mini Player"),
+            ("Recent Releases", "Uscite recenti"),
+            ("Suggestions", "Suggerimenti"),
+            ("Volume", "Volume"),
+            ("Controls", "Controlli"),
+            ("Watchlist", "Lista visione"),
+            ("Watchlist / Favorites", "Lista visione / Preferiti"),
+            ("Episodes / Files", "Episodi / File"),
+            ("Offline Catalog", "Catalogo Offline"),
+            ("Episodes", "Episodi"),
+            ("Typing...", "Scrittura in corso..."),
+            ("Typing…", "Scrittura in corso..."),
+            ("Relevance", "Rilevanza"),
+            ("Title A→Z", "Titolo A→Z"),
+            ("Title Z→A", "Titolo Z→A"),
+            ("Season: Any", "Stagione: Qualsiasi"),
+            ("Year: Any", "Anno: Qualsiasi"),
+            ("Rating: Any", "Rating: Qualsiasi"),
+            ("No results.", "Nessun risultato."),
+            ("Filtering...", "Filtraggio..."),
+            ("Filtering…", "Filtraggio..."),
+            ("Start queue", "Avvia coda"),
+            ("Cancel selected", "Annulla selezionato"),
+            ("Clear completed", "Pulisci completati"),
+            ("Refresh", "Aggiorna"),
+            ("Add current anime", "Aggiungi anime corrente"),
+            ("Remove selected", "Rimuovi selezionato"),
+            ("Add current episode", "Aggiungi episodio corrente"),
+            ("Exit FS", "Esci FS"),
+            ("Exit Mini", "Esci mini"),
+            ("Play", "Play"),
+            ("Pause", "Pausa"),
+            ("Sync now", "Sincronizza ora"),
+            ("Backup", "Backup"),
+        ]
+        if self.app_language == "en":
+            for en, it in pairs:
+                if text == it:
+                    return en
+        else:
+            for en, it in pairs:
+                if text == en:
+                    return it
+        return text
+
+    def _localize_runtime_text(self, text: str) -> str:
+        s = self._translate_literal(text)
+
+        def _rx(pat: str, it_fmt: str, en_fmt: str):
+            nonlocal s
+            m = re.fullmatch(pat, s)
+            if not m:
+                return
+            fmt = en_fmt if self.app_language == "en" else it_fmt
+            s = fmt.format(*m.groups())
+
+        _rx(r"Episodi: (\d+)", "Episodi: {}", "Episodes: {}")
+        _rx(r"Searching…", "Ricerca in corso…", "Searching...")
+        _rx(r"Carico recent \+ recommended…", "Carico recenti + consigliati…", "Loading recent + recommended...")
+        _rx(r"Trovati (\d+) risultati\.", "Trovati {} risultati.", "Found {} results.")
+        _rx(r"Selezionato: (.+) — carico episodi…", "Selezionato: {} — carico episodi…", "Selected: {} — loading episodes...")
+        _rx(r"Selezionato in cronologia: (.+)", "Selezionato in cronologia: {}", "Selected in history: {}")
+        _rx(r"Carico episodi per resume: (.+)…", "Carico episodi per ripresa: {}…", "Loading episodes for resume: {}...")
+        _rx(r"Apro dettagli anime: (.+)…", "Apro dettagli anime: {}…", "Opening anime details: {}...")
+        _rx(r"Risolvo stream ep (.+)…", "Risolvo stream ep {}…", "Resolving stream ep {}...")
+        _rx(r"Risolvo stream per download: (.+) ep (.+)", "Risolvo stream per download: {} ep {}", "Resolving stream for download: {} ep {}")
+        _rx(r"Aggiunto download: (.+) ep (.+)", "Aggiunto download: {} ep {}", "Added download: {} ep {}")
+        _rx(r"Aggiunti (\d+) episodi alla coda download\.", "Aggiunti {} episodi alla coda download.", "Added {} episodes to download queue.")
+        _rx(r"Gia presente: (.+)", "Gia presente: {}", "Already present: {}")
+        _rx(r"Integrity check fallita, retry: (.+) ep (.+)", "Integrity check fallita, retry: {} ep {}", "Integrity check failed, retry: {} ep {}")
+        _rx(r"▶ (.+) — ep (.+)", "▶ {} — ep {}", "▶ {} — ep {}")
+        _rx(r"▶ Offline: (.+)", "▶ Offline: {}", "▶ Offline: {}")
+        _rx(r"Segnato come visto: (.+) ep (.+)", "Segnato come visto: {} ep {}", "Marked as seen: {} ep {}")
+        _rx(r"Rimosso dalla cronologia\.", "Rimosso dalla cronologia.", "Removed from history.")
+        _rx(r"Backup creato: (.+)", "Backup creato: {}", "Backup created: {}")
+        _rx(r"Pull AniList -> Anigui in corso…", "Pull AniList -> Anigui in corso…", "AniList pull -> Anigui in progress...")
+        _rx(r"Pull AniList fallito\.", "Pull AniList fallito.", "AniList pull failed.")
+        _rx(r"Restore completato\.", "Ripristino completato.", "Restore completed.")
+        _rx(r"Catalogo offline\.", "Catalogo offline.", "Offline catalog.")
+        _rx(r"Ricerca anime\.", "Ricerca anime.", "Anime search.")
+        _rx(r"Lista episodi\.", "Lista episodi.", "Episode list.")
+        _rx(r"Aggiunto ai preferiti\.", "Aggiunto ai preferiti.", "Added to favorites.")
+        _rx(r"Download fallito\.", "Download fallito.", "Download failed.")
+        _rx(r"Download fallito \(integrity\)\.", "Download fallito (integrity).", "Download failed (integrity).")
+        _rx(r"Download annullato\.", "Download annullato.", "Download cancelled.")
+        _rx(r"Download completato: (.+)", "Download completato: {}", "Download completed: {}")
+        _rx(r"Errore resolve download\.", "Errore risoluzione download.", "Download resolve error.")
+        _rx(r"Scheduler attivo: fuori finestra oraria, coda in pausa\.", "Scheduler attivo: fuori finestra oraria, coda in pausa.", "Scheduler active: outside time window, queue paused.")
+        _rx(r"Incognito attivo: sync esterno disabilitato\.", "Incognito attivo: sync esterno disabilitato.", "Incognito active: external sync disabled.")
+        _rx(r"Incognito attivo: salvataggio settings bloccato\.", "Incognito attivo: salvataggio impostazioni bloccato.", "Incognito active: settings save blocked.")
+        _rx(r"Incognito attivo: restore bloccato\.", "Incognito attivo: ripristino bloccato.", "Incognito active: restore blocked.")
+        _rx(r"Incognito attivo: modifica cronologia bloccata\.", "Incognito attivo: modifica cronologia bloccata.", "Incognito active: history changes blocked.")
+        _rx(r"Modalita Incognito attiva: cache/salvataggi disabilitati\.", "Modalita Incognito attiva: cache/salvataggi disabilitati.", "Incognito mode enabled: cache/saves disabled.")
+        _rx(r"Modalita Incognito disattivata\.", "Modalita Incognito disattivata.", "Incognito mode disabled.")
+        _rx(r"Sincronizza ora: nessun anime/episodio attivo da sincronizzare\.", "Sincronizza ora: nessun anime/episodio attivo da sincronizzare.", "Sync now: no active anime/episode to sync.")
+        _rx(r"Sync now: nessun anime/episodio attivo da sincronizzare\.", "Sincronizza ora: nessun anime/episodio attivo da sincronizzare.", "Sync now: no active anime/episode to sync.")
+        _rx(r"Sincronizza ora: episodio non completato, sync non inviato\.", "Sincronizza ora: episodio non completato, sync non inviato.", "Sync now: episode not completed, sync not sent.")
+        _rx(r"Sync now: episodio non completato, sync non inviato\.", "Sincronizza ora: episodio non completato, sync non inviato.", "Sync now: episode not completed, sync not sent.")
+        _rx(r"Sincronizzazione AniList: (.+) ep (.+)…", "Sincronizzazione AniList: {} ep {}…", "AniList sync: {} ep {}...")
+        _rx(r"Sync AniList: (.+) ep (.+)…", "Sincronizzazione AniList: {} ep {}…", "AniList sync: {} ep {}...")
+        _rx(r"Sincronizzazione AniList ok: (.+) ep (.+)", "Sincronizzazione AniList ok: {} ep {}", "AniList sync ok: {} ep {}")
+        _rx(r"AniList sync ok: (.+) ep (.+)", "Sincronizzazione AniList ok: {} ep {}", "AniList sync ok: {} ep {}")
+        _rx(r"Sincronizzazione AniList fallita\.", "Sincronizzazione AniList fallita.", "AniList sync failed.")
+        _rx(r"AniList sync fallito\.", "Sincronizzazione AniList fallita.", "AniList sync failed.")
+        _rx(r"Test AniList in corso…", "Test AniList in corso…", "Testing AniList...")
+        _rx(r"AniList connesso: (.+)", "AniList connesso: {}", "AniList connected: {}")
+        _rx(r"AniList token mancante\.", "Token AniList mancante.", "AniList token missing.")
+        _rx(r"AniList non raggiungibile/token non valido\.", "AniList non raggiungibile/token non valido.", "AniList unavailable/invalid token.")
+        _rx(r"Impostazioni salvate\.", "Impostazioni salvate.", "Settings saved.")
+        _rx(r"Impostazioni ripristinate ai default \(premi Salva\)\.", "Impostazioni ripristinate ai default (premi Salva).", "Settings reset to defaults (press Save).")
+        _rx(r"Nessun nuovo episodio aggiunto \(gia in coda/attivi\)\.", "Nessun nuovo episodio aggiunto (gia in coda/attivi).", "No new episodes added (already queued/active).")
+        _rx(r"Inserisci prima il token AniList\.", "Inserisci prima il token AniList.", "Enter AniList token first.")
+        _rx(r"AniList test fallito: (.+)", "AniList test fallito: {}", "AniList test failed: {}")
+        _rx(r"AniList sync fallito: (.+)", "AniList sync fallito: {}", "AniList sync failed: {}")
+        _rx(r"Pull AniList fallito: (.+)", "Pull AniList fallito: {}", "AniList pull failed: {}")
+        _rx(r"Seleziona o avvia un episodio prima di aggiungerlo alla coda download\.", "Seleziona o avvia un episodio prima di aggiungerlo alla coda download.", "Select or start an episode before adding it to download queue.")
+        _rx(r"Apri prima un anime\.", "Apri prima un anime.", "Open an anime first.")
+        _rx(r"Seleziona uno o piu episodi dalla lista\.", "Seleziona uno o piu episodi dalla lista.", "Select one or more episodes from the list.")
+        _rx(r"Su Linux al momento e supportato solo Nautilus\.\nInstalla Nautilus oppure apri manualmente il percorso:\n(.+)", "Su Linux al momento e supportato solo Nautilus.\nInstalla Nautilus oppure apri manualmente il percorso:\n{}", "On Linux only Nautilus is currently supported.\nInstall Nautilus or open this path manually:\n{}")
+        _rx(r"Impossibile avviare Nautilus automaticamente\.\nPercorso: (.+)", "Impossibile avviare Nautilus automaticamente.\nPercorso: {}", "Could not launch Nautilus automatically.\nPath: {}")
+        _rx(r"File locale non trovato\.", "File locale non trovato.", "Local file not found.")
+        _rx(r"Download directory non valido\.", "Download directory non valido.", "Invalid download directory.")
+        _rx(r"Impossibile creare la cartella download: (.+)", "Impossibile creare la cartella download: {}", "Unable to create download directory: {}")
+        _rx(r"Formato scheduler non valido\. Usa HH:MM \(es\. 23:30\)\.", "Formato scheduler non valido. Usa HH:MM (es. 23:30).", "Invalid scheduler format. Use HH:MM (e.g. 23:30).")
+        _rx(r"Inserisci un AniList token oppure disattiva AniList sync\.", "Inserisci un AniList token oppure disattiva AniList sync.", "Enter an AniList token or disable AniList sync.")
+        _rx(r"Errore salvataggio settings: (.+)", "Errore salvataggio settings: {}", "Settings save error: {}")
+        _rx(r"Backup fallito: (.+)", "Backup fallito: {}", "Backup failed: {}")
+        _rx(r"Restore fallito: (.+)", "Restore fallito: {}", "Restore failed: {}")
+        _rx(r"Pronto\.", "Pronto.", "Ready.")
+        _rx(r"Errore\.", "Errore.", "Error.")
+        return s
+
+    def _translate_widget_tree(self):
+        for lbl in self.findChildren(QLabel):
+            txt = lbl.text()
+            new_txt = self._translate_literal(txt)
+            if new_txt != txt:
+                lbl.setText(new_txt)
+        for btn in self.findChildren(QPushButton):
+            txt = btn.text()
+            new_txt = self._translate_literal(txt)
+            if new_txt != txt:
+                btn.setText(new_txt)
+        for box in self.findChildren(QGroupBox):
+            txt = box.title()
+            new_txt = self._translate_literal(txt)
+            if new_txt != txt:
+                box.setTitle(new_txt)
+        for edit in self.findChildren(QLineEdit):
+            txt = edit.placeholderText()
+            new_txt = self._translate_literal(txt)
+            if new_txt != txt:
+                edit.setPlaceholderText(new_txt)
+
+    @staticmethod
+    def _combo_set_items(
+        combo: QComboBox,
+        items: list[tuple[str, Any]],
+        keep_data: Any = None,
+    ) -> None:
+        combo.blockSignals(True)
+        combo.clear()
+        for text, data in items:
+            combo.addItem(text, data)
+        if keep_data is not None:
+            idx = combo.findData(keep_data)
+            if idx >= 0:
+                combo.setCurrentIndex(idx)
+        combo.blockSignals(False)
+
+    def _apply_app_language_ui(self):
+        self.setWindowTitle("Anigui")
+
+        # Tabs
+        self.tabs.setTabText(self.tabs.indexOf(self.tab_search), self._tr("Cerca", "Search"))
+        self.tabs.setTabText(self.tabs.indexOf(self.tab_recommended), self._tr("Consigliati", "Recommended"))
+        self.tabs.setTabText(self.tabs.indexOf(self.tab_downloads), self._tr("Download", "Downloads"))
+        self.tabs.setTabText(self.tabs.indexOf(self.tab_offline), "Offline")
+        self.tabs.setTabText(self.tabs.indexOf(self.tab_favorites), self._tr("Preferiti", "Favorites"))
+        self.tabs.setTabText(self.tabs.indexOf(self.tab_settings), self._tr("Impostazioni", "Settings"))
+        self.tabs.setTabText(self.tabs.indexOf(self.tab_history), self._tr("Lista visione", "Watchlist"))
+
+        # Top/search/player
+        self.search_input.setPlaceholderText(self._tr("Cerca anime…", "Search anime..."))
+        self.btn_search.setText(self._tr("🔎 Cerca", "🔎 Search"))
+        self.btn_search.setToolTip(self._tr("Avvia ricerca anime", "Start anime search"))
+        self.btn_incognito.setToolTip(self._tr("Disabilita salvataggi locali e cache", "Disable local saves and cache"))
+        self.btn_incognito.setText(self._tr("Incognito ON", "Incognito ON") if self._incognito_enabled else self._tr("Incognito OFF", "Incognito OFF"))
+        self.btn_clear_search_history.setText(self._tr("🧹 Pulisci cronologia ricerche", "🧹 Clear search history"))
+        self.btn_back_catalog.setText(self._tr("← Torna alla ricerca", "← Back to Search"))
+        self.btn_queue_selected_eps.setText(self._tr("⬇ Metti in coda selezionati", "⬇ Queue selected"))
+        self.btn_fav_anime.setText(self._tr("❤ Preferito", "❤ Favorite"))
+        self.btn_back_episodes.setText(self._tr("← Torna agli episodi", "← Back to Episodes"))
+        self.btn_prev.setText(self._tr("⏮ Precedente", "⏮ Prev"))
+        self.btn_playpause.setText(self._tr("⏯ Play/Pause", "⏯ Play/Pause"))
+        self.btn_next.setText(self._tr("⏭ Successivo", "⏭ Next"))
+        self.btn_fs.setText(self._tr("⛶ Schermo intero", "⛶ Fullscreen"))
+        self.btn_mini.setText(self._tr("▣ Mini Player", "▣ Mini"))
+        self.lbl_player_title.setText(self._tr("Player", "Player"))
+
+        # Recommended
+        self.lbl_suggestions.setText(self._tr("Suggerimenti", "Suggestions"))
+        self.lbl_recommended.setText(self._tr("Uscite recenti + Consigliati", "Recent Releases + Recommended"))
+        self.lbl_recent_header.setText(self._tr("Uscite recenti", "Recent Releases"))
+        self.lbl_recommended_header.setText(self._tr("Consigliati", "Recommended"))
+
+        # Downloads / offline / favorites
+        self.btn_dl_open.setText(self._tr("📂 Apri cartella", "📂 Open folder"))
+        self.lbl_offline.setText(self._tr("Anime scaricati (stream locale)", "Downloaded anime (local stream)"))
+        self.btn_offline_open.setText(self._tr("📂 Apri download", "📂 Open downloads"))
+        self.btn_offline_back.setText(self._tr("← Torna al catalogo offline", "← Back to Offline Catalog"))
+        self.btn_fav_add_current.setText(self._tr("❤ Aggiungi anime corrente", "❤ Add current anime"))
+        self.btn_fav_remove.setText(self._tr("🗑 Rimuovi selezionato", "🗑 Remove selected"))
+        self.btn_dl_add_current.setText(self._tr("＋ Aggiungi episodio corrente", "＋ Add current episode"))
+        self.btn_dl_start.setText(self._tr("▶ Avvia coda", "▶ Start queue"))
+        self.btn_dl_start.setToolTip(self._tr("Avvia i download in coda", "Start queued downloads"))
+        self.btn_dl_cancel.setText(self._tr("✖ Annulla selezionato", "✖ Cancel selected"))
+        self.btn_dl_clear.setText(self._tr("🧹 Pulisci completati", "🧹 Clear completed"))
+        self.btn_refresh_recommended.setText(self._tr("↻ Aggiorna", "↻ Refresh"))
+        self.btn_offline_refresh.setText(self._tr("↻ Aggiorna", "↻ Refresh"))
+        self.lbl_anime_title.setText(self._tr("Anime", "Anime"))
+        self.lbl_offline_anime_title.setText(self._tr("Anime", "Anime"))
+
+        # Settings labels/buttons
+        self.lbl_settings_download_dir.setText(self._tr("Cartella download", "Download directory"))
+        self.lbl_settings_default_provider.setText(self._tr("Provider predefinito", "Default provider"))
+        self.lbl_settings_default_lang.setText(self._tr("Lingua predefinita", "Default language"))
+        self.lbl_settings_app_language.setText(self._tr("Lingua app", "App language"))
+        self.lbl_settings_default_quality.setText(self._tr("Qualita predefinita", "Default quality"))
+        self.lbl_settings_parallel_downloads.setText(self._tr("Download paralleli", "Parallel downloads"))
+        self.lbl_settings_scheduler.setText("Scheduler")
+        self.lbl_settings_scheduler_start.setText(self._tr("Inizio HH:MM", "Start HH:MM"))
+        self.lbl_settings_scheduler_end.setText(self._tr("Fine HH:MM", "End HH:MM"))
+        self.lbl_settings_integrity_min_mb.setText("Integrity min MB")
+        self.lbl_settings_retry_count.setText(self._tr("Numero retry", "Retry count"))
+        self.lbl_settings_anilist_sync.setText("AniList sync")
+        self.lbl_settings_anilist_token.setText("AniList token")
+        self.btn_settings_browse_download_dir.setText(self._tr("Sfoglia", "Browse"))
+        self.btn_settings_save.setText(self._tr("Salva impostazioni", "Save settings"))
+        self.btn_settings_reset.setText(self._tr("Reset predefiniti", "Reset defaults"))
+        self.btn_settings_backup.setText(self._tr("Backup", "Backup"))
+        self.btn_settings_restore.setText(self._tr("Ripristina", "Restore"))
+        self.btn_settings_anilist_test.setText(self._tr("Test connessione AniList", "Test AniList connection"))
+        self.btn_settings_anilist_sync_now.setText(self._tr("Sincronizza ora", "Sync now"))
+        self.btn_settings_anilist_pull.setText(self._tr("Importa da AniList", "Import from AniList"))
+        self.btn_settings_update_check.setText(self._tr("Controlla aggiornamenti", "Check updates"))
+        if platform.system() == "Windows" and getattr(sys, "frozen", False):
+            self.btn_settings_update_apply.setText(self._tr("Aggiorna ora", "Update now"))
+        else:
+            self.btn_settings_update_apply.setText(self._tr("Apri pagina update", "Open update page"))
+        self.btn_settings_anilist_sync_now.setToolTip(
+            self._tr("Invia subito il progresso corrente ad AniList", "Send current progress to AniList now")
+        )
+        self.btn_settings_anilist_pull.setToolTip(
+            self._tr("Importa watchlist/progressi da AniList", "Import watchlist/progress from AniList")
+        )
+
+        # Search filters
+        sort_idx = self.combo_sort.currentIndex()
+        self.combo_sort.blockSignals(True)
+        self.combo_sort.clear()
+        self.combo_sort.addItems(
+            [
+                self._tr("Rilevanza", "Relevance"),
+                self._tr("Titolo A→Z", "Title A→Z"),
+                self._tr("Titolo Z→A", "Title Z→A"),
+            ]
+        )
+        self.combo_sort.setCurrentIndex(max(0, sort_idx))
+        self.combo_sort.blockSignals(False)
+
+        season_idx = self.combo_season.currentIndex()
+        self.combo_season.blockSignals(True)
+        self.combo_season.clear()
+        self.combo_season.addItems(
+            [
+                self._tr("Stagione: Qualsiasi", "Season: Any"),
+                "Winter",
+                "Spring",
+                "Summer",
+                "Fall",
+            ]
+        )
+        self.combo_season.setCurrentIndex(max(0, season_idx))
+        self.combo_season.blockSignals(False)
+
+        if self.combo_year.count() > 0:
+            self.combo_year.setItemText(0, self._tr("Anno: Qualsiasi", "Year: Any"))
+
+        rating_idx = self.combo_rating.currentIndex()
+        self.combo_rating.blockSignals(True)
+        self.combo_rating.clear()
+        self.combo_rating.addItems(
+            [
+                self._tr("Rating: Qualsiasi", "Rating: Any"),
+                ">= 9",
+                ">= 8",
+                ">= 7",
+                ">= 6",
+            ]
+        )
+        self.combo_rating.setCurrentIndex(max(0, rating_idx))
+        self.combo_rating.blockSignals(False)
+
+        # Parallel download combos
+        dl_parallel_data = self.combo_dl_parallel.currentData()
+        self._combo_set_items(
+            self.combo_dl_parallel,
+            [
+                (self._tr("Paralleli x1", "Parallel x1"), 1),
+                (self._tr("Paralleli x2", "Parallel x2"), 2),
+                (self._tr("Paralleli x3", "Parallel x3"), 3),
+                (self._tr("Paralleli x4", "Parallel x4"), 4),
+            ],
+            keep_data=dl_parallel_data,
+        )
+
+        # Settings combos with translated labels
+        self._combo_set_items(
+            self.combo_settings_scheduler_enabled,
+            [
+                (self._tr("Disabilitato", "Disabled"), False),
+                (self._tr("Abilitato", "Enabled"), True),
+            ],
+            keep_data=self.combo_settings_scheduler_enabled.currentData(),
+        )
+        self._combo_set_items(
+            self.combo_settings_anilist_enabled,
+            [
+                (self._tr("Disabilitato", "Disabled"), False),
+                (self._tr("Abilitato", "Enabled"), True),
+            ],
+            keep_data=self.combo_settings_anilist_enabled.currentData(),
+        )
+
+        # History/watchlist
+        self.lbl_history_header.setText(
+            self._tr(
+                "Lista visione: Da iniziare · In corso · Completati",
+                "Watchlist: Planned · Watching · Completed",
+            )
+        )
+        self.lbl_history_filter.setText(self._tr("Filtro", "Filter"))
+        self._combo_set_items(
+            self.combo_history_filter,
+            [
+                (self._tr("Tutti", "All"), "All"),
+                (self._tr("Completati", "Completed"), "Completed"),
+                (self._tr("In corso", "Watching"), "Watching"),
+                (self._tr("Da iniziare", "Planned"), "Planned"),
+            ],
+            keep_data=self._history_filter,
+        )
+        self.btn_hist_resume.setText(self._tr("▶ Riprendi selezionato", "▶ Resume selected"))
+        self.btn_hist_resume_next.setText(self._tr("⏭ Riprendi prossimo", "⏭ Resume next"))
+        self.btn_hist_mark_seen.setText(self._tr("✅ Segna come visto", "✅ Mark as seen"))
+        self.btn_hist_delete.setText(self._tr("🗑 Rimuovi", "🗑 Remove"))
+        self.btn_clear_watch_history.setText(self._tr("🧹 Pulisci cronologia visione", "🧹 Clear watch history"))
+
+        # Anonymous labels/buttons created inline.
+        self._translate_widget_tree()
+        # Refresh lists that contain language-dependent placeholder/status labels.
+        self._refresh_downloads_ui()
+        self._refresh_recent_queries_ui()
+
+    def on_toggle_incognito(self, enabled: bool):
+        self._incognito_enabled = bool(enabled)
+        if self._incognito_enabled:
+            self.btn_incognito.setText(self._tr("Incognito ON", "Incognito ON"))
+            self.lbl_incognito_badge.setVisible(True)
+            self.set_status("Modalita Incognito attiva: cache/salvataggi disabilitati.")
+        else:
+            self.btn_incognito.setText(self._tr("Incognito OFF", "Incognito OFF"))
+            self.lbl_incognito_badge.setVisible(False)
+            self.set_status("Modalita Incognito disattivata.")
+
+    def _anilist_headers(self) -> dict[str, str]:
+        return self._anilist_headers_for_token(self._anilist_token)
+
+    def _anilist_headers_for_token(self, token: str | None) -> dict[str, str]:
+        h = {
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+            "User-Agent": "Anigui/1.0 (+https://anilist.co)",
+        }
+        t = self._normalize_anilist_token(token)
+        if t:
+            h["Authorization"] = f"Bearer {t}"
+        return h
+
+    @staticmethod
+    def _normalize_anilist_token(token: str | None) -> str:
+        t = (token or "").strip()
+        if not t:
+            return ""
+        if t.lower().startswith("bearer "):
+            t = t[7:].strip()
+        # If user pasted full redirect URL or fragment, extract access_token.
+        if "access_token=" in t:
+            try:
+                frag = urlsplit(t).fragment or ""
+                if frag:
+                    q = parse_qs(frag)
+                    val = q.get("access_token", [])
+                    if val and val[0]:
+                        return str(val[0]).strip()
+                # fallback: parse from raw string
+                q = parse_qs(t.replace("#", "&").replace("?", "&"))
+                val = q.get("access_token", [])
+                if val and val[0]:
+                    return str(val[0]).strip()
+            except Exception:
+                pass
+        return t
+
+    def _anilist_graphql(self, query: str, variables: dict[str, Any], token: str | None = None) -> dict[str, Any]:
+        req = urllib.request.Request(
+            "https://graphql.anilist.co",
+            data=json.dumps({"query": query, "variables": variables}).encode("utf-8"),
+            headers=self._anilist_headers_for_token(token if token is not None else self._anilist_token),
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=12.0) as r:
+                raw = r.read()
+        except urllib.error.HTTPError as ex:
+            body = ""
+            try:
+                body = ex.read().decode("utf-8", errors="ignore").strip()
+            except Exception:
+                body = ""
+            msg = f"HTTP {ex.code} {ex.reason}"
+            if body:
+                msg = f"{msg} - {body[:400]}"
+            raise RuntimeError(msg) from ex
+        payload = json.loads(raw.decode("utf-8", errors="ignore"))
+        if isinstance(payload, dict) and payload.get("errors"):
+            raise RuntimeError(str(payload["errors"]))
+        if not isinstance(payload, dict):
+            raise RuntimeError("AniList response non valida.")
+        return payload
+
+    @staticmethod
+    def _anilist_status_for_entry(entry: HistoryEntry) -> str:
+        # Episode-complete sync should not mark the whole series as completed.
+        return "CURRENT"
+
+    def _anilist_sync_key(self, entry: HistoryEntry) -> str:
+        return f"{entry.provider}:{entry.identifier}:{entry.lang}"
+
+    def _anilist_sync_progress_async(self, entry: HistoryEntry, force: bool = False):
+        if self._incognito_enabled:
+            return
+        if not self._anilist_enabled:
+            return
+        if not (self._anilist_token or "").strip():
+            return
+        if not bool(entry.completed):
+            return
+        progress = int(max(1, float(entry.last_ep)))
+        key = self._anilist_sync_key(entry)
+        prev = int(self._anilist_last_synced_progress.get(key, 0))
+        now = time.time()
+        if not force:
+            if progress <= prev:
+                return
+            if now - float(self._anilist_last_sync_ts.get(key, 0.0)) < 20.0:
+                return
+
+        w = Worker(
+            self._anilist_sync_worker,
+            entry.name,
+            progress,
+            self._anilist_status_for_entry(entry),
+            self._anilist_token,
+        )
+
+        def on_ok(_res: object, k=key, p=progress):
+            self._anilist_last_synced_progress[k] = max(
+                p, int(self._anilist_last_synced_progress.get(k, 0))
+            )
+            self._anilist_last_sync_ts[k] = time.time()
+
+        def on_err(msg: str):
+            debug_log(f"AniList sync failed: {msg}")
+
+        w.ok.connect(on_ok)
+        w.err.connect(on_err)
+        self._workers.append(w)
+        w.start()
+
+    def _anilist_sync_worker(
+        self,
+        anime_name: str,
+        progress: int,
+        status: str,
+        token: str | None = None,
+    ) -> dict[str, Any]:
+        cache_key = anime_name.strip().lower()
+        media_id = self._anilist_media_id_cache.get(cache_key)
+        if media_id is None:
+            q = """
+            query ($search: String) {
+              Media(search: $search, type: ANIME) { id }
+            }
+            """
+            payload = self._anilist_graphql(q, {"search": anime_name}, token=token)
+            media = (
+                payload.get("data", {}).get("Media")
+                if isinstance(payload.get("data"), dict)
+                else None
+            )
+            if not isinstance(media, dict) or not media.get("id"):
+                raise RuntimeError(f"AniList match non trovato: {anime_name}")
+            media_id = int(media["id"])
+            self._anilist_media_id_cache[cache_key] = media_id
+
+        m = """
+        mutation ($mediaId: Int, $status: MediaListStatus, $progress: Int) {
+          SaveMediaListEntry(mediaId: $mediaId, status: $status, progress: $progress) {
+            id
+            status
+            progress
+          }
+        }
+        """
+        payload = self._anilist_graphql(
+            m,
+            {
+                "mediaId": int(media_id),
+                "status": status,
+                "progress": int(max(1, progress)),
+            },
+            token=token,
+        )
+        return payload.get("data", {})
+
+    def _anilist_active_token_from_ui(self) -> str:
+        tok = ""
+        if hasattr(self, "input_settings_anilist_token"):
+            tok = self.input_settings_anilist_token.text().strip()
+        if not tok:
+            tok = (self._anilist_token or "").strip()
+        return self._normalize_anilist_token(tok)
+
+    @staticmethod
+    def _norm_title(s: str) -> str:
+        s = (s or "").strip().lower()
+        s = re.sub(r"[^a-z0-9]+", " ", s)
+        return re.sub(r"\s+", " ", s).strip()
+
+    @staticmethod
+    def _planned_identifier_from_titles(
+        titles: list[str],
+        media_id: int | None = None,
+        entry_id: int | None = None,
+    ) -> str:
+        if media_id is not None and int(media_id) > 0:
+            return f"planned:anilist:{int(media_id)}"
+        if entry_id is not None and int(entry_id) > 0:
+            return f"planned:anilist-entry:{int(entry_id)}"
+        base = " | ".join([t.strip() for t in titles if str(t).strip()]) or "planned"
+        h = hashlib.sha1(base.encode("utf-8", errors="ignore")).hexdigest()[:16]
+        return f"planned:{h}"
+
+    def _search_items_for_provider(
+        self,
+        query: str,
+        provider_name: str,
+        lang: Any,
+        strict_lang: bool = True,
+    ) -> list[SearchItem]:
+        if not query.strip():
+            return []
+        if self._is_aw_provider_name(provider_name):
+            provider = self._aw_provider(provider_name)
+            res = provider.search(query) or []
+            out: list[SearchItem] = []
+            for r in res:
+                is_dub = bool(getattr(r, "dub", False))
+                if strict_lang:
+                    if lang == LanguageTypeEnum.DUB and not is_dub:
+                        continue
+                    if lang == LanguageTypeEnum.SUB and is_dub:
+                        continue
+                out.append(
+                    SearchItem(
+                        name=r.name,
+                        identifier=str(getattr(r, "ref", "")),
+                        languages={LanguageTypeEnum.DUB} if is_dub else {LanguageTypeEnum.SUB},
+                        cover_url=None,
+                        source=provider_name,
+                        raw=r,
+                    )
+                )
+            return out
+        provider = get_provider(provider_name)
+        res = provider.get_search(query)
+        return [
+            SearchItem(
+                r.name,
+                r.identifier,
+                r.languages,
+                cover_url=self._extract_cover_url(r),
+                source=provider_name,
+                raw=r,
+            )
+            for r in res
+        ]
+
+    def _pick_best_item_for_titles(
+        self,
+        titles: list[str],
+        items: list[SearchItem],
+    ) -> SearchItem | None:
+        if not items:
+            return None
+        norm_titles = [self._norm_title(t) for t in titles if t and self._norm_title(t)]
+        if not norm_titles:
+            return items[0]
+        for t in norm_titles:
+            for it in items:
+                if self._norm_title(it.name) == t:
+                    return it
+        for t in norm_titles:
+            for it in items:
+                n = self._norm_title(it.name)
+                if t in n or n in t:
+                    return it
+        return items[0]
+
+    def _anilist_fetch_progress_entries(self, token: str) -> list[dict[str, Any]]:
+        q = """
+        query {
+          Viewer {
+            id
+            name
+            mediaListOptions { scoreFormat }
+          }
+          MediaListCollection(
+            userId: 0,
+            type: ANIME,
+            status_in: [CURRENT, REPEATING, COMPLETED, PLANNING]
+          ) {
+            lists {
+              status
+              entries {
+                id
+                progress
+                media {
+                  id
+                  title { romaji english native }
+                }
+              }
+            }
+          }
+        }
+        """
+        # AniList does not accept userId:0, resolve viewer first.
+        v = self._anilist_graphql("query { Viewer { id name } }", {}, token=token)
+        viewer = v.get("data", {}).get("Viewer") if isinstance(v.get("data"), dict) else None
+        if not isinstance(viewer, dict) or not viewer.get("id"):
+            raise RuntimeError("Impossibile leggere Viewer AniList.")
+        user_id = int(viewer["id"])
+        q2 = """
+        query ($userId: Int) {
+          MediaListCollection(
+            userId: $userId,
+            type: ANIME,
+            status_in: [CURRENT, REPEATING, COMPLETED, PLANNING]
+          ) {
+            lists {
+              status
+              entries {
+                id
+                progress
+                media {
+                  id
+                  title { romaji english native }
+                }
+              }
+            }
+          }
+        }
+        """
+        payload = self._anilist_graphql(q2, {"userId": user_id}, token=token)
+        coll = payload.get("data", {}).get("MediaListCollection") if isinstance(payload.get("data"), dict) else None
+        lists = coll.get("lists", []) if isinstance(coll, dict) else []
+        out: list[dict[str, Any]] = []
+        for lst in lists:
+            if not isinstance(lst, dict):
+                continue
+            status = str(lst.get("status", "") or "")
+            for e in lst.get("entries", []) or []:
+                if not isinstance(e, dict):
+                    continue
+                entry_id = int(e.get("id") or 0) if isinstance(e.get("id"), (int, float, str)) else 0
+                prog = int(e.get("progress") or 0)
+                media = e.get("media") if isinstance(e.get("media"), dict) else {}
+                media_id = int(media.get("id") or 0) if isinstance(media.get("id"), (int, float, str)) else 0
+                title = media.get("title") if isinstance(media.get("title"), dict) else {}
+                titles = [
+                    str(title.get("english") or "").strip(),
+                    str(title.get("romaji") or "").strip(),
+                    str(title.get("native") or "").strip(),
+                ]
+                titles = [t for t in titles if t]
+                if not titles and media_id > 0:
+                    titles = [f"AniList #{media_id}"]
+                if not titles and entry_id > 0:
+                    titles = [f"AniList entry #{entry_id}"]
+                if not titles:
+                    titles = ["Planned anime"]
+                out.append(
+                    {
+                        "status": status,
+                        "progress": prog,
+                        "titles": titles,
+                        "media_id": media_id,
+                        "entry_id": entry_id,
+                    }
+                )
+        return out
+
+    def _anilist_pull_worker(
+        self,
+        token: str,
+        provider_name: str,
+        lang_name: str,
+    ) -> dict[str, Any]:
+        lang = LanguageTypeEnum.DUB if lang_name == "DUB" else LanguageTypeEnum.SUB
+        rows = self._anilist_fetch_progress_entries(token)
+        seen_ident: set[str] = set()
+        built: list[HistoryEntry] = []
+        skipped = 0
+        remote_planned = 0
+        imported_planned = 0
+        planned_all_keys: list[str] = []
+        planned_all_seen: set[str] = set()
+        planned_imported_keys: set[str] = set()
+        for row in rows:
+            titles = list(row.get("titles", []))
+            progress = int(row.get("progress") or 0)
+            media_id = int(row.get("media_id") or 0)
+            entry_id = int(row.get("entry_id") or 0)
+            remote_status = str(row.get("status") or "").upper()
+            planned_key = ""
+            if remote_status == "PLANNING":
+                if media_id > 0:
+                    planned_key = f"m:{media_id}"
+                elif entry_id > 0:
+                    planned_key = f"e:{entry_id}"
+                else:
+                    planned_key = f"t:{self._planned_identifier_from_titles(titles)}"
+            if remote_status == "PLANNING":
+                remote_planned += 1
+                if planned_key and planned_key not in planned_all_seen:
+                    planned_all_seen.add(planned_key)
+                    planned_all_keys.append(planned_key)
+            found: SearchItem | None = None
+            for t in titles:
+                items = self._search_items_for_provider(t, provider_name, lang)
+                found = self._pick_best_item_for_titles(titles, items)
+                if found is not None:
+                    break
+            if found is None and remote_status == "PLANNING":
+                for t in titles:
+                    items = self._search_items_for_provider(
+                        t,
+                        provider_name,
+                        lang,
+                        strict_lang=False,
+                    )
+                    found = self._pick_best_item_for_titles(titles, items)
+                    if found is not None:
+                        break
+            if found is None:
+                if remote_status == "PLANNING":
+                    placeholder_id = self._planned_identifier_from_titles(
+                        titles,
+                        media_id=media_id,
+                        entry_id=entry_id,
+                    )
+                    uniq = f"{provider_name}:{placeholder_id}:{lang_name}"
+                    if uniq in seen_ident:
+                        if planned_key:
+                            planned_imported_keys.add(planned_key)
+                        continue
+                    seen_ident.add(uniq)
+                    fallback_name = next((t for t in titles if t.strip()), f"AniList #{media_id}" if media_id > 0 else "Planned anime")
+                    built.append(
+                        HistoryEntry(
+                            provider=provider_name,
+                            identifier=placeholder_id,
+                            name=fallback_name,
+                            lang=lang_name,
+                            last_ep=0.0,
+                            updated_at=time.time(),
+                            cover_url=None,
+                            last_pos=0.0,
+                            last_duration=0.0,
+                            last_percent=0.0,
+                            completed=False,
+                            watched_eps=[],
+                            episode_progress={},
+                        )
+                    )
+                    imported_planned += 1
+                    if planned_key:
+                        planned_imported_keys.add(planned_key)
+                    continue
+                skipped += 1
+                continue
+            uniq = f"{provider_name}:{found.identifier}:{lang_name}"
+            if uniq in seen_ident:
+                if remote_status == "PLANNING":
+                    # Provider dedupe collision: still keep this AniList planning entry via placeholder.
+                    placeholder_id = self._planned_identifier_from_titles(
+                        titles,
+                        media_id=media_id,
+                        entry_id=entry_id,
+                    )
+                    puniq = f"{provider_name}:{placeholder_id}:{lang_name}"
+                    if puniq not in seen_ident:
+                        seen_ident.add(puniq)
+                        fallback_name = next((t for t in titles if t.strip()), f"AniList #{media_id}" if media_id > 0 else "Planned anime")
+                        built.append(
+                            HistoryEntry(
+                                provider=provider_name,
+                                identifier=placeholder_id,
+                                name=fallback_name,
+                                lang=lang_name,
+                                last_ep=0.0,
+                                updated_at=time.time(),
+                                cover_url=None,
+                                last_pos=0.0,
+                                last_duration=0.0,
+                                last_percent=0.0,
+                                completed=False,
+                                watched_eps=[],
+                                episode_progress={},
+                            )
+                        )
+                    imported_planned += 1
+                    if planned_key:
+                        planned_imported_keys.add(planned_key)
+                continue
+            seen_ident.add(uniq)
+
+            progress = max(0, int(progress))
+            prog = float(progress)
+            watched = [float(i) for i in range(1, int(prog) + 1)] if progress <= 400 else [prog]
+            if progress <= 0:
+                watched = []
+            ep_prog: dict[str, dict[str, Any]] = {}
+            for epf in watched[:400]:
+                ep_key = str(int(epf)) if float(epf).is_integer() else str(epf)
+                ep_prog[ep_key] = {
+                    "pos": 0.0,
+                    "dur": 0.0,
+                    "percent": 100.0,
+                    "completed": True,
+                    "updated_at": time.time(),
+                }
+            built.append(
+                HistoryEntry(
+                    provider=provider_name,
+                    identifier=found.identifier,
+                    name=found.name,
+                    lang=lang_name,
+                    last_ep=prog,
+                    updated_at=time.time(),
+                    cover_url=found.cover_url,
+                    last_pos=0.0,
+                    last_duration=0.0,
+                    last_percent=100.0 if progress > 0 else 0.0,
+                    completed=(remote_status == "COMPLETED"),
+                    watched_eps=watched,
+                    episode_progress=ep_prog,
+                )
+            )
+            if remote_status == "PLANNING":
+                imported_planned += 1
+                if planned_key:
+                    planned_imported_keys.add(planned_key)
+        planned_missing_keys = [k for k in planned_all_keys if k not in planned_imported_keys]
+        return {
+            "total_remote": len(rows),
+            "built": built,
+            "skipped": skipped,
+            "remote_planned": remote_planned,
+            "imported_planned": imported_planned,
+            "planned_missing_keys": planned_missing_keys,
+        }
+
+    def _anilist_test_connection_worker(self, token: str) -> str:
+        q = """
+        query {
+          Viewer { id name }
+        }
+        """
+        payload = self._anilist_graphql(q, {}, token=token)
+        viewer = payload.get("data", {}).get("Viewer") if isinstance(payload.get("data"), dict) else None
+        if not isinstance(viewer, dict) or not viewer.get("name"):
+            raise RuntimeError("AniList viewer non disponibile.")
+        return str(viewer.get("name"))
+
+    def on_anilist_test_connection(self):
+        token = self._anilist_active_token_from_ui()
+        if not token:
+            self.notify_err("Inserisci prima il token AniList.")
+            self.set_status("AniList token mancante.")
+            return
+        self.set_status("Test AniList in corso…")
+        self._begin_request()
+        w = Worker(self._anilist_test_connection_worker, token)
+
+        def on_ok(name: str):
+            self._end_request()
+            self.set_status(f"AniList connesso: {name}")
+
+        def on_err(msg: str):
+            self._end_request()
+            self.notify_err(f"AniList test fallito: {msg}")
+            self.set_status("AniList non raggiungibile/token non valido.")
+
+        w.ok.connect(on_ok)
+        w.err.connect(on_err)
+        self._workers.append(w)
+        w.start()
+
+    def on_anilist_sync_now(self):
+        if self._incognito_enabled:
+            self.set_status("Incognito attivo: sync esterno disabilitato.")
+            return
+        token = self._anilist_active_token_from_ui()
+        if not token:
+            self.notify_err("Inserisci prima il token AniList.")
+            return
+
+        anime_name: str | None = None
+        progress = 0
+        completed = False
+        source = "none"
+
+        if self.selected_anime is not None and self.current_ep is not None:
+            anime_name = str(getattr(self.selected_anime, "name", "")).strip() or None
+            progress = int(max(1, float(self.current_ep)))
+            try:
+                pos = float(self.player.get_time_pos() or 0.0)
+                dur = float(self.player.get_duration() or 0.0)
+                completed = self._is_episode_completed(pos, dur)
+                source = "active-player"
+            except Exception:
+                completed = False
+                source = "active-player-exc"
+            if not completed:
+                hist_active = self._current_history_entry()
+                if hist_active is not None:
+                    hp, hc = self._history_entry_best_progress_and_completed_for_sync(hist_active)
+                    if hp > 0 and hc:
+                        progress = hp
+                        completed = True
+                        source = "active-history-fallback"
+        else:
+            e = self._history_entry_for_sync_now()
+            if e is not None:
+                anime_name = e.name
+                progress, completed = self._history_entry_best_progress_and_completed_for_sync(e)
+                source = "history"
+
+        debug_log(
+            "sync-now candidate: "
+            f"source={source} anime={anime_name!r} progress={progress} completed={completed}"
+        )
+
+        fail_reason = ""
+        if not anime_name:
+            fail_reason = "no-anime"
+        elif int(progress) <= 0:
+            fail_reason = "no-progress"
+        elif not bool(completed):
+            fail_reason = "not-completed"
+
+        if fail_reason:
+            debug_log(
+                "sync-now blocked: "
+                f"reason={fail_reason} source={source} anime={anime_name!r} "
+                f"progress={progress} completed={completed}"
+            )
+            if fail_reason in ("no-anime", "no-progress"):
+                self.set_status("Sincronizza ora: nessun anime/episodio attivo da sincronizzare.")
+            else:
+                self.set_status("Sincronizza ora: episodio non completato, sync non inviato.")
+            return
+
+        status = "CURRENT"
+        self.set_status(f"Sincronizzazione AniList: {anime_name} ep {progress}…")
+        self._begin_request()
+        w = Worker(self._anilist_sync_worker, anime_name, progress, status, token)
+
+        def on_ok(_data: object, name=anime_name, ep=progress):
+            self._end_request()
+            self.set_status(f"Sincronizzazione AniList ok: {name} ep {ep}")
+
+        def on_err(msg: str):
+            self._end_request()
+            self.notify_err(f"AniList sync fallito: {msg}")
+            self.set_status("Sincronizzazione AniList fallita.")
+
+        w.ok.connect(on_ok)
+        w.err.connect(on_err)
+        self._workers.append(w)
+        w.start()
+
+    def _history_entry_for_sync_now(self) -> HistoryEntry | None:
+        if getattr(self, "_selected_history", None):
+            return self._selected_history
+        try:
+            cur = self._history_entry_from_current_item()
+            if cur is not None:
+                self._selected_history = cur
+                return self._selected_history
+        except Exception:
+            pass
+        items = self.history.list()
+        if items:
+            self._selected_history = items[0]
+            return self._selected_history
+        return None
+
+    def _history_entry_best_progress_for_sync(self, entry: HistoryEntry) -> int:
+        best, _completed = self._history_entry_best_progress_and_completed_for_sync(entry)
+        return best
+
+    def _history_entry_best_progress_and_completed_for_sync(self, entry: HistoryEntry) -> tuple[int, bool]:
+        vals: list[float] = []
+        completed_vals: list[float] = []
+        try:
+            w = [float(x) for x in (entry.watched_eps or [])]
+            vals.extend(w)
+            completed_vals.extend(w)
+        except Exception:
+            pass
+        ep_map = entry.episode_progress if isinstance(entry.episode_progress, dict) else {}
+        for k, v in ep_map.items():
+            try:
+                epf = float(k)
+            except Exception:
+                continue
+            if isinstance(v, dict):
+                comp = bool(v.get("completed", False))
+                vals.append(epf)
+                if comp:
+                    completed_vals.append(epf)
+        if not vals:
+            return 0, False
+        best = max(vals)
+        best_completed = max(completed_vals) if completed_vals else 0.0
+        if best_completed > 0:
+            return int(max(1, best_completed)), True
+        return int(max(1, best)), False
+
+    def on_anilist_pull_from_remote(self):
+        if self._incognito_enabled:
+            self.set_status("Incognito attivo: sync esterno disabilitato.")
+            return
+        token = self._anilist_active_token_from_ui()
+        if not token:
+            self.notify_err("Inserisci prima il token AniList.")
+            return
+        provider_name = str(self.provider_name or "allanime")
+        lang_name = "DUB" if self.lang == LanguageTypeEnum.DUB else "SUB"
+        self.set_status("Pull AniList -> Anigui in corso…")
+        self._begin_request()
+        w = Worker(self._anilist_pull_worker, token, provider_name, lang_name)
+
+        def on_ok(res: dict[str, Any]):
+            self._end_request()
+            built = list(res.get("built") or [])
+            imported = 0
+            skipped_local = 0
+            for incoming in built:
+                existing: HistoryEntry | None = None
+                for e in self.history._data:
+                    if (
+                        e.provider == incoming.provider
+                        and e.identifier == incoming.identifier
+                        and e.lang == incoming.lang
+                    ):
+                        existing = e
+                        break
+                if existing is None:
+                    self.history.upsert(incoming)
+                    imported += 1
+                    continue
+
+                # Never downgrade local progress.
+                if float(existing.last_ep) > float(incoming.last_ep):
+                    skipped_local += 1
+                    continue
+
+                merged = HistoryEntry(
+                    provider=existing.provider,
+                    identifier=existing.identifier,
+                    name=existing.name or incoming.name,
+                    lang=existing.lang,
+                    last_ep=max(float(existing.last_ep), float(incoming.last_ep)),
+                    updated_at=time.time(),
+                    cover_url=existing.cover_url or incoming.cover_url,
+                    last_pos=existing.last_pos,
+                    last_duration=existing.last_duration,
+                    last_percent=max(float(existing.last_percent), float(incoming.last_percent)),
+                    completed=bool(existing.completed or incoming.completed),
+                    watched_eps=sorted(
+                        set(float(x) for x in (existing.watched_eps or []))
+                        | set(float(x) for x in (incoming.watched_eps or []))
+                    ),
+                    episode_progress=dict(existing.episode_progress or {}),
+                )
+                for k, v in (incoming.episode_progress or {}).items():
+                    if k not in merged.episode_progress:
+                        merged.episode_progress[k] = v
+                self.history.upsert(merged)
+                imported += 1
+
+            self.refresh_history_ui()
+            planned_missing = list(res.get("planned_missing_keys") or [])
+            planned_all = int(res.get("remote_planned", 0))
+            planned_imp = int(res.get("imported_planned", 0))
+            debug_log(
+                "AniList pull planned diag: "
+                f"imported={planned_imp}/{planned_all} "
+                f"missing={planned_missing}"
+            )
+            diag = ""
+            if planned_missing:
+                preview = ", ".join(str(x) for x in planned_missing[:8])
+                if len(planned_missing) > 8:
+                    preview += ", ..."
+                diag = self._tr(
+                    f" chiavi pianificate mancanti: {preview}",
+                    f" missing planned keys: {preview}",
+                )
+            self.set_status(
+                self._tr(
+                    "Pull AniList completato: "
+                    f"{imported} importati, "
+                    f"{int(res.get('skipped', 0))} non matchati, "
+                    f"{skipped_local} ignorati (progress locale migliore), "
+                    f"pianificati {int(res.get('imported_planned', 0))}/{int(res.get('remote_planned', 0))}."
+                    f"{diag}",
+                    "AniList pull completed: "
+                    f"{imported} imported, "
+                    f"{int(res.get('skipped', 0))} unmatched, "
+                    f"{skipped_local} skipped (better local progress), "
+                    f"planned {int(res.get('imported_planned', 0))}/{int(res.get('remote_planned', 0))}."
+                    f"{diag}",
+                )
+            )
+
+        def on_err(msg: str):
+            self._end_request()
+            self.notify_err(f"Pull AniList fallito: {msg}")
+            self.set_status("Pull AniList fallito.")
+
+        w.ok.connect(on_ok)
+        w.err.connect(on_err)
+        self._workers.append(w)
+        w.start()
+
+
+    @staticmethod
+    def _is_local_media_file(path: str) -> bool:
+        ext = os.path.splitext(path)[1].lower()
+        return ext in {".mp4", ".mkv", ".avi", ".mov", ".webm", ".m4v"}
+
+    @staticmethod
+    def _natural_sort_key(text: str):
+        return [int(s) if s.isdigit() else s.lower() for s in re.split(r"(\d+)", text)]
+
+    def refresh_offline_library(self):
+        self._offline_nonce += 1
+        nonce = self._offline_nonce
+        self.offline_results.clear()
+        self.offline_episodes.clear()
+        self.offline_stack.setCurrentWidget(self.page_offline_catalog)
+        self._offline_items = []
+        self._offline_episode_files = []
+        self._offline_current_anime_dir = None
+        self._offline_current_episode_index = None
+
+        try:
+            os.makedirs(self.download_dir, exist_ok=True)
+        except Exception:
+            pass
+
+        dirs: list[str] = []
+        try:
+            for name in os.listdir(self.download_dir):
+                full = os.path.join(self.download_dir, name)
+                if not os.path.isdir(full):
+                    continue
+                try:
+                    has_media = any(
+                        self._is_local_media_file(os.path.join(full, f))
+                        for f in os.listdir(full)
+                    )
+                except Exception:
+                    has_media = False
+                if has_media:
+                    dirs.append(full)
+        except Exception:
+            dirs = []
+
+        dirs.sort(key=lambda p: self._natural_sort_key(os.path.basename(p)))
+        self._offline_items = [
+            OfflineAnimeItem(
+                name=os.path.basename(d),
+                folder=d,
+                cover_url=self._offline_cover_url_for_name(os.path.basename(d)),
+            )
+            for d in dirs
+        ]
+
+        if not self._offline_items:
+            self.offline_results.addItem(self._tr("(nessun anime scaricato)", "(no downloaded anime)"))
+            self.offline_results.item(0).setFlags(Qt.ItemFlag.NoItemFlags)
+            return
+
+        placeholder = self._make_cover_placeholder()
+        for row, it in enumerate(self._offline_items):
+            item = QListWidgetItem(placeholder, it.name)
+            item.setTextAlignment(Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignTop)
+            item.setSizeHint(QSize(170, 290))
+            self.offline_results.addItem(item)
+            if it.cover_url:
+                w = Worker(self._offline_cover_cached_only, it.cover_url)
+                w.ok.connect(lambda data, r=row, n=nonce: self._on_offline_cover_loaded(r, n, data[0], data[1]))
+                w.err.connect(lambda _msg: None)
+                self._workers.append(w)
+                w.start()
+
+    def on_pick_offline_anime(self):
+        row = self.offline_results.currentRow()
+        if row < 0 or row >= len(self._offline_items):
+            return
+        picked = self._offline_items[row]
+        anime_dir = picked.folder
+        if not anime_dir or not os.path.isdir(anime_dir):
+            return
+
+        self.offline_episodes.clear()
+        files: list[str] = []
+        try:
+            for name in os.listdir(anime_dir):
+                full = os.path.join(anime_dir, name)
+                if os.path.isfile(full) and self._is_local_media_file(full):
+                    files.append(full)
+        except Exception:
+            files = []
+
+        files.sort(key=lambda p: self._natural_sort_key(os.path.basename(p)))
+        self._offline_current_anime_dir = anime_dir
+        self._offline_episode_files = files
+        self._offline_current_episode_index = None
+        self.lbl_offline_anime_title.setText(picked.name)
+        self.offline_stack.setCurrentWidget(self.page_offline_anime)
+
+        if not files:
+            self.offline_episodes.addItem(self._tr("(nessun episodio/file)", "(no episodes/files)"))
+            self.offline_episodes.item(0).setFlags(Qt.ItemFlag.NoItemFlags)
+            return
+
+        for fp in files:
+            it = QListWidgetItem(os.path.basename(fp))
+            it.setData(Qt.ItemDataRole.UserRole, fp)
+            self.offline_episodes.addItem(it)
+
+    def on_play_offline_episode(self, *_args):
+        item = self.offline_episodes.currentItem()
+        if item is None:
+            return
+        fp = item.data(Qt.ItemDataRole.UserRole)
+        if not fp or not os.path.isfile(fp):
+            return
+        try:
+            idx = self._offline_episode_files.index(fp)
+        except Exception:
+            idx = None
+        self._offline_current_episode_index = idx
+        self._play_local_file(fp)
+
+    def on_offline_back_to_catalog(self):
+        self._save_current_progress(force=True)
+        if self._is_video_fullscreen():
+            self._exit_video_fullscreen()
+        try:
+            self.player.stop()
+        except Exception:
+            pass
+        self._local_media_active = False
+        self._offline_current_episode_index = None
+        self.current_ep = None
+        self.offline_stack.setCurrentWidget(self.page_offline_catalog)
+        self.set_status("Catalogo offline.")
+
+    def _offline_cover_url_for_name(self, name: str) -> str | None:
+        target = self._safe_name(name or "").lower()
+        if not target:
+            return None
+        mapped = self._offline_covers_map.get(target)
+        if mapped:
+            return mapped
+        for e in self.history.list():
+            hist_name = self._safe_name(e.name or "").lower()
+            if hist_name == target and e.cover_url:
+                self._remember_offline_cover_url(name, e.cover_url)
+                return e.cover_url
+        return None
+
+    def _offline_cover_cached_only(self, cover_ref: str) -> tuple[bytes | None, bool]:
+        # cover_ref can be:
+        # 1) local cache path (*.img) [new format]
+        # 2) original URL [legacy format]
+        ref = (cover_ref or "").strip()
+        if not ref:
+            return None, False
+        if ref.lower().endswith(".img") and os.path.exists(ref):
+            cache_path = ref
+        else:
+            cache_path = self._cover_cache_path(ref)
+        if not cache_path or not os.path.exists(cache_path):
+            return None, False
+        try:
+            with open(cache_path, "rb") as f:
+                data = f.read()
+            return (data if data else None), bool(data)
+        except Exception:
+            return None, False
+
+    def _on_offline_cover_loaded(self, row: int, nonce: int, data: bytes | None, from_cache: bool):
+        if nonce != self._offline_nonce:
+            return
+        if data is None:
+            return
+        if row < 0 or row >= self.offline_results.count():
+            return
+        pix = QPixmap()
+        if not pix.loadFromData(data):
+            return
+        if from_cache:
+            pix = self._apply_cached_badge(pix)
+        scaled = pix.scaled(
+            self.offline_results.iconSize(),
+            Qt.AspectRatioMode.KeepAspectRatioByExpanding,
+            Qt.TransformationMode.SmoothTransformation,
+        )
+        self.offline_results.item(row).setIcon(QIcon(scaled))
+
+    def _play_local_file(self, path: str):
+        if not os.path.isfile(path):
+            self.notify_err("File locale non trovato.")
+            return
+
+        self._save_current_progress(force=True)
+        self._pending_resume_seek = None
+        self._pending_resume_seek_attempts = 0
+        self._resume_marker_pos = None
+        self._local_media_active = True
+        self.current_ep = None
+        self.selected_anime = None
+        self.selected_search_item = None
+
+        self.tabs.setCurrentWidget(self.tab_search)
+        self.search_stack.setCurrentWidget(self.page_player)
+        self._current_search_view = "player"
+        self._refresh_search_layout()
+        base = os.path.basename(path)
+        self.lbl_player_title.setText(f"Offline — {base}")
+        self.set_status(f"▶ Offline: {base}")
+        self._set_transport_enabled(False)
+        try:
+            self.player.load(path, referrer=None, sub_file=None)
+        finally:
+            self._set_transport_enabled(True)
+
+    def on_back_to_catalog(self):
+        self._save_current_progress(force=True)
+        if self._is_video_fullscreen():
+            self._exit_video_fullscreen()
+        try:
+            self.player.stop()
+        except Exception:
+            pass
+        self._local_media_active = False
+        self._offline_current_episode_index = None
+        self.current_ep = None
+        self.search_stack.setCurrentWidget(self.page_catalog)
+        self._current_search_view = "catalog"
+        self._refresh_search_layout()
+        self.set_status("Ricerca anime.")
+
+    def on_back_to_episodes(self):
+        self._save_current_progress(force=True)
+        if self._is_video_fullscreen():
+            self._exit_video_fullscreen()
+        try:
+            self.player.stop()
+        except Exception:
+            pass
+        self._local_media_active = False
+        self._offline_current_episode_index = None
+        self.current_ep = None
+        self.search_stack.setCurrentWidget(self.page_anime)
+        self._current_search_view = "anime"
+        self._refresh_search_layout()
+        self.set_status("Lista episodi.")
+
+    @staticmethod
+    def _is_episode_completed(pos: float, dur: float) -> bool:
+        if dur <= 0:
+            return False
+        remaining = max(0.0, dur - pos)
+        return (pos / dur) >= 0.97 or remaining <= 90.0
+
+    @staticmethod
+    def _is_episode_completed_by_percent(percent: float | None) -> bool:
+        if percent is None:
+            return False
+        try:
+            p = float(percent)
+        except Exception:
+            return False
+        return p >= 97.0
+
+    def _save_current_progress(self, force: bool = False):
+        if self._incognito_enabled:
+            return
+        if self._local_media_active:
+            return
+        if not self.selected_anime or self.current_ep is None:
+            return
+        try:
+            pos_raw = self.player.get_time_pos()
+        except Exception:
+            pos_raw = None
+        try:
+            dur_raw = self.player.get_duration()
+        except Exception:
+            dur_raw = None
+        try:
+            percent_raw = self.player.get_percent_pos()
+        except Exception:
+            percent_raw = None
+
+        now = time.time()
+
+        identifier = (
+            getattr(self.selected_anime, "identifier", None)
+            or getattr(self.selected_anime, "_identifier", None)
+            or getattr(self.selected_anime, "ref", "")
+        )
+        ident_s = str(identifier)
+        lang_s = "SUB" if self.lang == LanguageTypeEnum.SUB else "DUB"
+
+        prev_entry: HistoryEntry | None = None
+        for e in self.history._data:
+            if e.provider == self.provider_name and e.identifier == ident_s and e.lang == lang_s:
+                prev_entry = e
+                break
+
+        dur: float | None
+        if dur_raw is not None:
+            dur = max(0.0, float(dur_raw))
+        elif prev_entry is not None:
+            dur = max(0.0, float(prev_entry.last_duration))
+        else:
+            dur = None
+
+        percent: float | None = None
+        if percent_raw is not None:
+            try:
+                percent = max(0.0, min(100.0, float(percent_raw)))
+            except Exception:
+                percent = None
+        elif prev_entry is not None and float(getattr(prev_entry, "last_percent", 0.0) or 0.0) > 0.0:
+            percent = max(0.0, min(100.0, float(prev_entry.last_percent)))
+
+        pos: float | None = None
+        if pos_raw is not None:
+            pos = max(0.0, float(pos_raw))
+        elif dur is not None and dur > 0 and percent_raw is not None:
+            try:
+                pos = max(0.0, min(dur, dur * (float(percent_raw) / 100.0)))
+            except Exception:
+                pos = None
+        elif prev_entry is not None:
+            pos = max(0.0, float(prev_entry.last_pos))
+
+        # if we still cannot resolve a timeline position and no percent exists, skip save
+        if pos is None and percent is None:
+            return
+        if pos is None:
+            pos = max(0.0, float(prev_entry.last_pos)) if prev_entry is not None else 0.0
+        if dur is None:
+            dur = 0.0
+
+        if not force:
+            pos_delta_small = abs(pos - self._last_progress_pos) < 5.0
+            pct_now = float(percent) if percent is not None else -1.0
+            pct_delta_small = abs(pct_now - self._last_progress_percent) < 1.0
+            if now - self._last_progress_save_at < 5.0 and pos_delta_small and pct_delta_small:
+                return
+
+        watched_eps: list[float] = list(prev_entry.watched_eps) if prev_entry is not None else []
+        episode_progress: dict[str, dict[str, Any]] = (
+            dict(prev_entry.episode_progress)
+            if prev_entry is not None and isinstance(prev_entry.episode_progress, dict)
+            else {}
+        )
+        cover_url = (
+            getattr(self.selected_search_item, "cover_url", None)
+            if self.selected_search_item
+            else (prev_entry.cover_url if prev_entry is not None else None)
+        )
+        episode_completed_now = self._is_episode_completed(pos, dur) or self._is_episode_completed_by_percent(percent)
+        completed_now = episode_completed_now and self._is_last_available_episode(
+            self.current_ep,
+            self.episodes_list,
+        )
+
+        entry = HistoryEntry(
+            provider=self.provider_name,
+            identifier=ident_s,
+            name=self.selected_anime.name,
+            lang=lang_s,
+            cover_url=cover_url,
+            last_ep=float(self.current_ep),
+            updated_at=now,
+            last_pos=pos,
+            last_duration=dur,
+            last_percent=float(percent) if percent is not None else 0.0,
+            completed=completed_now,
+            watched_eps=watched_eps,
+            episode_progress=episode_progress,
+        )
+        self._entry_set_episode_progress(
+            entry,
+            self.current_ep,
+            pos=pos,
+            dur=dur,
+            percent=float(percent) if percent is not None else 0.0,
+            completed=episode_completed_now,
+        )
+        if episode_completed_now:
+            self._entry_add_watched_ep(entry, self.current_ep)
+        self.history.upsert(entry)
+        self._anilist_sync_progress_async(entry, force=force)
+        self._last_progress_save_at = now
+        self._last_progress_pos = pos
+        self._last_progress_percent = float(percent) if percent is not None else -1.0
+        if force:
+            self.refresh_history_ui()
+
+    def _try_apply_resume_seek_ratio(self):
+        ratio = self._pending_resume_seek_ratio
+        if ratio is None:
+            return
+        try:
+            self.player.seek_ratio(float(ratio))
+        except Exception:
+            pass
+        self._pending_resume_seek_ratio = None
+
+    def _try_apply_resume_seek(self):
+        target = self._pending_resume_seek
+        if target is None:
+            return
+        self._pending_resume_seek_attempts += 1
+        try:
+            self.player.seek(target)
+        except Exception:
+            pass
+
+        cur = self.player.get_time_pos()
+        if cur is not None and abs(float(cur) - target) <= 8.0:
+            self._pending_resume_seek = None
+            return
+
+        if self._pending_resume_seek_attempts < 8:
+            QTimer.singleShot(350, self._try_apply_resume_seek)
+        else:
+            self._pending_resume_seek = None
+            if self._pending_resume_seek_ratio is not None:
+                QTimer.singleShot(0, self._try_apply_resume_seek_ratio)
+
+    @staticmethod
+    def fmt_time(sec: float | None) -> str:
+        if sec is None or sec != sec or sec < 0:
+            return "00:00"
+        s = int(sec)
+        m = s // 60
+        s = s % 60
+        h = m // 60
+        m = m % 60
+        if h > 0:
+            return f"{h:02d}:{m:02d}:{s:02d}"
+        return f"{m:02d}:{s:02d}"
+
+    def _fmt_relative_time(self, ts: float | None) -> str:
+        if not ts:
+            return self._tr("proprio adesso", "just now")
+        delta = max(0, int(time.time() - float(ts)))
+        if delta < 60:
+            return self._tr("proprio adesso", "just now")
+        if delta < 3600:
+            n = delta // 60
+            return self._tr(
+                f"{n} minuto{'i' if n != 1 else ''} fa",
+                f"{n} minute{'s' if n != 1 else ''} ago",
+            )
+        if delta < 86400:
+            n = delta // 3600
+            return self._tr(
+                f"{n} ora{'e' if n != 1 else ''} fa",
+                f"{n} hour{'s' if n != 1 else ''} ago",
+            )
+        if delta < 86400 * 30:
+            n = delta // 86400
+            return self._tr(
+                f"{n} giorno{'i' if n != 1 else ''} fa",
+                f"{n} day{'s' if n != 1 else ''} ago",
+            )
+        if delta < 86400 * 365:
+            n = delta // (86400 * 30)
+            return self._tr(
+                f"{n} mese{'i' if n != 1 else ''} fa",
+                f"{n} month{'s' if n != 1 else ''} ago",
+            )
+        n = delta // (86400 * 365)
+        return self._tr(
+            f"{n} anno{'i' if n != 1 else ''} fa",
+            f"{n} year{'s' if n != 1 else ''} ago",
+        )
+
+    @staticmethod
+    def _extract_cover_url(obj: Any) -> str | None:
+        for key in ("cover", "cover_url", "image", "img", "poster", "thumbnail"):
+            v = getattr(obj, key, None)
+            if isinstance(v, str) and v.strip():
+                return v.strip()
+        return None
+
+    def _episode_label(self, ep: float | int) -> str:
+        return self._tr(f"Episodio {ep}", f"Episode {ep}")
+
+    @staticmethod
+    def _to_ep_float(ep: float | int | str | None) -> float | None:
+        try:
+            return float(ep) if ep is not None else None
+        except Exception:
+            return None
+
+    def _entry_watched_eps_set(self, entry: HistoryEntry) -> set[float]:
+        out: set[float] = set()
+        for v in (entry.watched_eps or []):
+            f = self._to_ep_float(v)
+            if f is not None:
+                out.add(f)
+        # Legacy fallback: consider only current episode as seen if the entry is completed.
+        if not out and bool(entry.completed):
+            last = self._to_ep_float(entry.last_ep)
+            if last is not None and last > 0:
+                out.add(float(last))
+        return out
+
+    def _entry_add_watched_ep(self, entry: HistoryEntry, ep: float | int | str | None) -> None:
+        f = self._to_ep_float(ep)
+        if f is None or f <= 0:
+            return
+        eps = self._entry_watched_eps_set(entry)
+        eps.add(float(f))
+        entry.watched_eps = sorted(eps)
+
+    @staticmethod
+    def _ep_key(ep: float | int | str | None) -> str:
+        try:
+            f = float(ep)
+            if f.is_integer():
+                return str(int(f))
+            return str(f)
+        except Exception:
+            return str(ep or "")
+
+    def _entry_episode_progress_map(self, entry: HistoryEntry) -> dict[float, dict[str, Any]]:
+        out: dict[float, dict[str, Any]] = {}
+        raw = entry.episode_progress if isinstance(entry.episode_progress, dict) else {}
+        for k, v in raw.items():
+            try:
+                epf = float(k)
+            except Exception:
+                continue
+            if isinstance(v, dict):
+                out[epf] = dict(v)
+        return out
+
+    def _entry_get_episode_progress(
+        self,
+        entry: HistoryEntry,
+        ep: float | int | str | None,
+    ) -> dict[str, Any] | None:
+        key = self._ep_key(ep)
+        raw = entry.episode_progress if isinstance(entry.episode_progress, dict) else {}
+        val = raw.get(key)
+        return dict(val) if isinstance(val, dict) else None
+
+    def _entry_set_episode_progress(
+        self,
+        entry: HistoryEntry,
+        ep: float | int | str | None,
+        pos: float,
+        dur: float,
+        percent: float,
+        completed: bool,
+    ) -> None:
+        raw = dict(entry.episode_progress) if isinstance(entry.episode_progress, dict) else {}
+        raw[self._ep_key(ep)] = {
+            "pos": float(max(0.0, pos)),
+            "dur": float(max(0.0, dur)),
+            "percent": float(max(0.0, min(100.0, percent))),
+            "completed": bool(completed),
+            "updated_at": time.time(),
+        }
+        entry.episode_progress = raw
+
+    def _is_last_available_episode(
+        self,
+        ep: float | int | str | None,
+        available_eps: list[float | int] | None,
+    ) -> bool:
+        if not available_eps:
+            return False
+        epf = self._to_ep_float(ep)
+        if epf is None:
+            return False
+        vals: list[float] = []
+        for x in available_eps:
+            xf = self._to_ep_float(x)
+            if xf is not None:
+                vals.append(xf)
+        if not vals:
+            return False
+        max_ep = max(vals)
+        return abs(epf - max_ep) < 1e-6
+
+    def _entry_is_series_completed(
+        self,
+        entry: HistoryEntry,
+        available_eps: list[float | int] | None,
+    ) -> bool:
+        if not available_eps:
+            return False
+        vals: list[float] = []
+        for x in available_eps:
+            xf = self._to_ep_float(x)
+            if xf is not None:
+                vals.append(xf)
+        if not vals:
+            return False
+        max_ep = max(vals)
+        watched = self._entry_watched_eps_set(entry)
+        if any(abs(max_ep - w) < 1e-6 for w in watched):
+            return True
+        p = self._entry_get_episode_progress(entry, max_ep)
+        return bool(p and p.get("completed", False))
+
+    def _is_aw_provider_name(self, name: str) -> bool:
+        return name in ("aw_animeworld", "aw_animeunity")
+
+    def _ensure_aw_runtime(self):
+        if self._aw_runtime_ready:
+            return
+        if platform.system() == "Windows":
+            shim_dir = os.path.join(app_state_dir(), "aw_shims")
+            os.makedirs(shim_dir, exist_ok=True)
+            uname_bat = os.path.join(shim_dir, "uname.bat")
+            if not os.path.exists(uname_bat):
+                with open(uname_bat, "w", encoding="utf-8") as f:
+                    f.write("@echo off\n")
+                    f.write("echo Windows_NT anigui\n")
+            cur_path = os.environ.get("PATH", "")
+            parts = cur_path.split(os.pathsep) if cur_path else []
+            if shim_dir not in parts:
+                os.environ["PATH"] = shim_dir + os.pathsep + cur_path
+        self._aw_runtime_ready = True
+
+    def _aw_provider_class(self, name: str):
+        self._ensure_aw_runtime()
+        try:
+            mod = importlib.import_module("aw_cli.providers")
+        except Exception as ex:
+            raise RuntimeError(
+                "Provider ITA non disponibile: controlla aw-cli su questo sistema "
+                f"(errore import: {ex})."
+            ) from ex
+
+        if name == "aw_animeworld":
+            return getattr(mod, "Animeworld")
+        if name == "aw_animeunity":
+            return getattr(mod, "Animeunity")
+        raise RuntimeError(f"Provider ITA sconosciuto: {name}")
+
+    def _aw_provider(self, name: str | None = None):
+        key = name or self.provider_name
+        if not self._is_aw_provider_name(key):
+            raise RuntimeError("Provider non-ITA richiesto come aw-cli.")
+        self._ensure_aw_config()
+        if key not in self._aw_provider_instances:
+            cls = self._aw_provider_class(key)
+            self._aw_provider_instances[key] = cls()
+        return self._aw_provider_instances[key]
+
+    def _aw_anime_class(self):
+        if self._aw_anime_cls is not None:
+            return self._aw_anime_cls
+        self._ensure_aw_runtime()
+        try:
+            mod = importlib.import_module("aw_cli.anime")
+        except Exception as ex:
+            raise RuntimeError(
+                "Provider ITA non disponibile: controlla aw-cli su questo sistema "
+                f"(errore import: {ex})."
+            ) from ex
+        self._aw_anime_cls = getattr(mod, "Anime")
+        return self._aw_anime_cls
+
+    def _aw_cover_cache_key(self, item: SearchItem) -> str:
+        return f"{item.source}:{item.identifier}"
+
+    def _aw_resolve_cover_url(self, item: SearchItem) -> str | None:
+        key = self._aw_cover_cache_key(item)
+        miss_until = self._aw_cover_miss_until.get(key)
+        if miss_until is not None and time.time() < miss_until:
+            return None
+        if key in self._aw_cover_url_cache:
+            return self._aw_cover_url_cache[key]
+
+        url: str | None = None
+        try:
+            provider = self._aw_provider(item.source)
+            if item.source == "aw_animeunity":
+                ident = str(item.identifier)
+                if ident.isdigit():
+                    r = provider.Client.get(f"{provider.BASE_URL}/info_api/{ident}/")
+                    r.raise_for_status()
+                    data = r.json()
+                    for k in ("imageurl", "image_url", "image", "cover", "poster"):
+                        v = data.get(k)
+                        if isinstance(v, str) and v.strip():
+                            url = v.strip()
+                            break
+            elif item.source == "aw_animeworld":
+                ref = str(item.identifier)
+                if ref and not ref.startswith("http"):
+                    ref = provider.BASE_URL.rstrip("/") + "/" + ref.lstrip("/")
+                if ref:
+                    if hasattr(provider, "_get_html"):
+                        html = provider._get_html(ref)
+                    else:
+                        r = provider.Client.get(ref)
+                        r.raise_for_status()
+                        html = r.text
+                    m = re.search(
+                        r"<meta[^>]+property=['\"]og:image['\"][^>]+content=['\"]([^'\"]+)['\"]",
+                        html,
+                        re.IGNORECASE,
+                    )
+                    if not m:
+                        m = re.search(
+                            r"<meta[^>]+content=['\"]([^'\"]+)['\"][^>]+property=['\"]og:image['\"]",
+                            html,
+                            re.IGNORECASE,
+                        )
+                    if not m:
+                        m = re.search(
+                            r'<img[^>]+class="[^"]*poster[^"]*"[^>]+(?:src|data-src)="([^"]+)"',
+                            html,
+                            re.IGNORECASE,
+                        )
+                    if m:
+                        url = m.group(1).strip()
+                        if url.startswith("/"):
+                            url = provider.BASE_URL.rstrip("/") + url
+                    if not url:
+                        # fallback permissivo: prima immagine assoluta nel markup
+                        m = re.search(
+                            r"(https?:\\/\\/[^'\"\\s>]+\\.(?:jpg|jpeg|png|webp))",
+                            html,
+                            re.IGNORECASE,
+                        )
+                        if m:
+                            url = m.group(1).replace("\\/", "/")
+                    if not url:
+                        # fallback: cerca in pagina search per nome anime
+                        q = quote_plus(item.name)
+                        s_html = provider._get_html(f"{provider.BASE_URL}/search?keyword={q}")
+                        href = str(item.identifier)
+                        href_rel = href.replace(provider.BASE_URL, "")
+                        block_pat = re.compile(
+                            r'<div class="inner">(?P<block>.*?)</div>',
+                            re.IGNORECASE | re.DOTALL,
+                        )
+                        for bm in block_pat.finditer(s_html):
+                            block = bm.group("block")
+                            if href not in block and href_rel not in block:
+                                continue
+                            im = re.search(
+                                r'(?:src|data-src)=["\']([^"\']+\.(?:jpg|jpeg|png|webp)[^"\']*)["\']',
+                                block,
+                                re.IGNORECASE,
+                            )
+                            if im:
+                                url = im.group(1).strip()
+                                if url.startswith("//"):
+                                    url = "https:" + url
+                                elif url.startswith("/"):
+                                    url = provider.BASE_URL.rstrip("/") + url
+                                break
+        except Exception:
+            url = None
+
+        if url:
+            self._aw_cover_url_cache[key] = url
+            self._aw_cover_miss_until.pop(key, None)
+        else:
+            self._aw_cover_miss_until[key] = time.time() + 600.0
+            debug_log(f"cover resolve miss: source={item.source} id={item.identifier}")
+        return url
+
+    def _ensure_aw_config(self):
+        if self._aw_config_ready:
+            return
+        self._ensure_aw_runtime()
+        try:
+            ut_mod = importlib.import_module("aw_cli.utilities")
+        except Exception:
+            return
+        cfg = getattr(ut_mod, "configData", None)
+        if cfg is None:
+            self._aw_config_ready = True
+            return
+        general = cfg.setdefault("general", {})
+        general.setdefault("specials", False)
+        self._aw_config_ready = True
+
+    def _make_cover_placeholder(self, title: str | None = None) -> QIcon:
+        pix = QPixmap(300, 440)
+        pix.fill(QColor("#2b2b2b"))
+        painter = QPainter(pix)
+        painter.fillRect(0, 0, 300, 100, QColor(229, 9, 20, 90))
+        if title:
+            painter.setPen(QColor("#e9edf1"))
+            painter.drawText(
+                16,
+                280,
+                268,
+                130,
+                Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignTop | Qt.TextFlag.TextWordWrap,
+                title,
+            )
+        painter.end()
+        return QIcon(pix)
+
+    def _make_skeleton_pixmap(self, size: QSize, phase: int) -> QPixmap:
+        w = max(1, size.width())
+        h = max(1, size.height())
+        pix = QPixmap(w, h)
+        pix.fill(QColor("#1e1e1e"))
+        painter = QPainter(pix)
+        band_w = max(30, w // 4)
+        x = (phase % (w + band_w)) - band_w
+        grad = QColor(255, 255, 255, 30)
+        painter.fillRect(x, 0, band_w, h, grad)
+        painter.end()
+        return pix
+
+    def _start_skeletons(self):
+        if not self._skeleton_timer.isActive():
+            self._skeleton_timer.start()
+
+    def _update_skeletons(self):
+        self._skeleton_phase += 8
+        any_loading = False
+        for lw in (self.results, self.recent, self.recommended):
+            for i in range(lw.count()):
+                item = lw.item(i)
+                if item.data(Qt.ItemDataRole.UserRole) != "loading":
+                    continue
+                any_loading = True
+                pix = self._make_skeleton_pixmap(lw.iconSize(), self._skeleton_phase)
+                item.setIcon(QIcon(pix))
+        if not any_loading:
+            self._skeleton_timer.stop()
+
+    def _apply_cached_badge(self, pix: QPixmap) -> QPixmap:
+        out = QPixmap(pix)
+        painter = QPainter(out)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        radius = max(8, out.width() // 14)
+        painter.setBrush(QColor(46, 184, 92, 220))
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.drawEllipse(out.width() - radius * 2 - 6, 6, radius * 2, radius * 2)
+        painter.setPen(QColor("#ffffff"))
+        painter.drawText(out.width() - radius * 2 - 6, 6, radius * 2, radius * 2, Qt.AlignmentFlag.AlignCenter, "C")
+        painter.end()
+        return out
+
+    def _begin_request(self):
+        self._requests_in_flight += 1
+        if not self._spinner_timer.isActive():
+            self._spinner_timer.start()
+
+    def _end_request(self):
+        self._requests_in_flight = max(0, self._requests_in_flight - 1)
+        if self._requests_in_flight == 0:
+            self._spinner_timer.stop()
+            self.lbl_spinner.setText("")
+
+    def _spin_tick(self):
+        if self._requests_in_flight <= 0:
+            self.lbl_spinner.setText("")
+            return
+        self._spinner_idx = (self._spinner_idx + 1) % len(self._spinner_frames)
+        self.lbl_spinner.setText(self._spinner_frames[self._spinner_idx])
+
+    @staticmethod
+    def _default_settings_dict() -> dict[str, Any]:
+        return {
+            "download_dir": os.path.join(app_state_dir(), "downloads"),
+            "default_provider": "allanime",
+            "default_lang": "SUB",
+            "default_quality": "best",
+            "parallel_downloads": 2,
+            "scheduler_enabled": False,
+            "scheduler_start": "00:00",
+            "scheduler_end": "23:59",
+            "integrity_min_mb": 2.0,
+            "integrity_retry_count": 1,
+            "anilist_enabled": False,
+            "anilist_token": "",
+            "app_language": "it",
+        }
+
+    def _load_settings(self) -> dict[str, Any]:
+        base = self._default_settings_dict()
+        try:
+            with open(SETTINGS_PATH, "r", encoding="utf-8") as f:
+                raw = json.load(f)
+            if isinstance(raw, dict):
+                base.update(raw)
+        except Exception:
+            pass
+        return base
+
+    def _save_settings(self, settings: dict[str, Any]):
+        if self._incognito_enabled:
+            return
+        tmp = SETTINGS_PATH + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(settings, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, SETTINGS_PATH)
+        self._settings = dict(settings)
+
+    def _apply_runtime_from_settings(self):
+        dl_dir = str(self._settings.get("download_dir", "")).strip()
+        if dl_dir:
+            self.download_dir = os.path.abspath(os.path.expanduser(dl_dir))
+        else:
+            self.download_dir = os.path.join(app_state_dir(), "downloads")
+        os.makedirs(self.download_dir, exist_ok=True)
+        self.provider_name = str(self._settings.get("default_provider", "allanime"))
+        if self.provider_name not in ("allanime", "aw_animeworld", "aw_animeunity"):
+            self.provider_name = "allanime"
+        lang_s = str(self._settings.get("default_lang", "SUB")).upper()
+        self.lang = LanguageTypeEnum.DUB if lang_s == "DUB" else LanguageTypeEnum.SUB
+        self.quality = str(self._settings.get("default_quality", "best"))
+        if self.quality not in ("best", "worst", "360", "480", "720", "1080"):
+            self.quality = "best"
+        try:
+            self._max_parallel_downloads = int(self._settings.get("parallel_downloads", 2))
+        except Exception:
+            self._max_parallel_downloads = 2
+        self._max_parallel_downloads = max(1, min(4, self._max_parallel_downloads))
+        self._scheduler_enabled = bool(self._settings.get("scheduler_enabled", False))
+        self._scheduler_start = str(self._settings.get("scheduler_start", "00:00"))
+        self._scheduler_end = str(self._settings.get("scheduler_end", "23:59"))
+        try:
+            self._integrity_min_mb = float(self._settings.get("integrity_min_mb", 2.0))
+        except Exception:
+            self._integrity_min_mb = 2.0
+        self._integrity_min_mb = max(0.0, self._integrity_min_mb)
+        try:
+            self._integrity_retry_count = int(self._settings.get("integrity_retry_count", 1))
+        except Exception:
+            self._integrity_retry_count = 1
+        self._integrity_retry_count = max(0, min(5, self._integrity_retry_count))
+        self._anilist_enabled = bool(self._settings.get("anilist_enabled", False))
+        self._anilist_token = str(self._settings.get("anilist_token", "")).strip()
+        self.app_language = str(self._settings.get("app_language", "it")).strip().lower()
+        if self.app_language not in ("it", "en"):
+            self.app_language = "it"
+
+        pidx = self.provider_combo.findData(self.provider_name)
+        if pidx >= 0:
+            self.provider_combo.setCurrentIndex(pidx)
+        self.lang_combo.setCurrentIndex(1 if self.lang == LanguageTypeEnum.DUB else 0)
+        qidx = self.quality_combo.findText(self.quality)
+        if qidx >= 0:
+            self.quality_combo.setCurrentIndex(qidx)
+        self.combo_dl_parallel.setCurrentIndex(self._max_parallel_downloads - 1)
+        self._apply_provider_ui_state()
+        self._apply_app_language_ui()
+
+    def _sync_settings_ui_from_state(self):
+        if not hasattr(self, "input_settings_download_dir"):
+            return
+        self.input_settings_download_dir.setText(self.download_dir)
+        pidx = self.combo_settings_provider.findData(self.provider_name)
+        if pidx >= 0:
+            self.combo_settings_provider.setCurrentIndex(pidx)
+        self.combo_settings_lang.setCurrentIndex(1 if self.lang == LanguageTypeEnum.DUB else 0)
+        qidx = self.combo_settings_quality.findData(self.quality)
+        if qidx >= 0:
+            self.combo_settings_quality.setCurrentIndex(qidx)
+        didx = self.combo_settings_parallel.findData(self._max_parallel_downloads)
+        if didx >= 0:
+            self.combo_settings_parallel.setCurrentIndex(didx)
+        sidx = self.combo_settings_scheduler_enabled.findData(self._scheduler_enabled)
+        if sidx >= 0:
+            self.combo_settings_scheduler_enabled.setCurrentIndex(sidx)
+        self.input_settings_scheduler_start.setText(self._scheduler_start)
+        self.input_settings_scheduler_end.setText(self._scheduler_end)
+        self.input_settings_integrity_min_mb.setText(str(self._integrity_min_mb))
+        ridx = self.combo_settings_integrity_retries.findData(self._integrity_retry_count)
+        if ridx >= 0:
+            self.combo_settings_integrity_retries.setCurrentIndex(ridx)
+        aidx = self.combo_settings_anilist_enabled.findData(self._anilist_enabled)
+        if aidx >= 0:
+            self.combo_settings_anilist_enabled.setCurrentIndex(aidx)
+        lidx = self.combo_settings_app_language.findData(self.app_language)
+        if lidx >= 0:
+            self.combo_settings_app_language.setCurrentIndex(lidx)
+        self.input_settings_anilist_token.setText(self._anilist_token)
+
+    def on_settings_browse_download_dir(self):
+        start = self.input_settings_download_dir.text().strip() or self.download_dir
+        picked = QFileDialog.getExistingDirectory(
+            self,
+            self._tr("Seleziona cartella download", "Select download directory"),
+            start,
+        )
+        if picked:
+            self.input_settings_download_dir.setText(os.path.abspath(picked))
+
+    def on_settings_save(self):
+        if self._incognito_enabled:
+            self.set_status("Incognito attivo: salvataggio settings bloccato.")
+            return
+        download_dir = self.input_settings_download_dir.text().strip()
+        if not download_dir:
+            self.notify_err("Download directory non valido.")
+            return
+        download_dir = os.path.abspath(os.path.expanduser(download_dir))
+        try:
+            os.makedirs(download_dir, exist_ok=True)
+        except Exception as ex:
+            self.notify_err(f"Impossibile creare la cartella download: {ex}")
+            return
+
+        provider = str(self.combo_settings_provider.currentData() or "allanime")
+        lang_s = str(self.combo_settings_lang.currentData() or "SUB").upper()
+        quality = str(self.combo_settings_quality.currentData() or "best")
+        parallel = int(self.combo_settings_parallel.currentData() or 2)
+        parallel = max(1, min(4, parallel))
+        scheduler_enabled = bool(self.combo_settings_scheduler_enabled.currentData())
+        scheduler_start = self.input_settings_scheduler_start.text().strip()
+        scheduler_end = self.input_settings_scheduler_end.text().strip()
+        if scheduler_enabled:
+            if self._parse_hhmm(scheduler_start) is None or self._parse_hhmm(scheduler_end) is None:
+                self.notify_err("Formato scheduler non valido. Usa HH:MM (es. 23:30).")
+                return
+        try:
+            integrity_min_mb = float(self.input_settings_integrity_min_mb.text().strip())
+        except Exception:
+            integrity_min_mb = self._integrity_min_mb
+        integrity_min_mb = max(0.0, integrity_min_mb)
+        integrity_retry_count = int(self.combo_settings_integrity_retries.currentData() or 1)
+        integrity_retry_count = max(0, min(5, integrity_retry_count))
+        anilist_enabled = bool(self.combo_settings_anilist_enabled.currentData())
+        anilist_token = self.input_settings_anilist_token.text().strip()
+        app_language = str(self.combo_settings_app_language.currentData() or "it").strip().lower()
+        if app_language not in ("it", "en"):
+            app_language = "it"
+        if anilist_enabled and not anilist_token:
+            self.notify_err("Inserisci un AniList token oppure disattiva AniList sync.")
+            return
+
+        settings = {
+            "download_dir": download_dir,
+            "default_provider": provider,
+            "default_lang": lang_s,
+            "default_quality": quality,
+            "parallel_downloads": parallel,
+            "scheduler_enabled": scheduler_enabled,
+            "scheduler_start": scheduler_start,
+            "scheduler_end": scheduler_end,
+            "integrity_min_mb": integrity_min_mb,
+            "integrity_retry_count": integrity_retry_count,
+            "anilist_enabled": anilist_enabled,
+            "anilist_token": anilist_token,
+            "app_language": app_language,
+        }
+        try:
+            self._save_settings(settings)
+        except Exception as ex:
+            self.notify_err(f"Errore salvataggio settings: {ex}")
+            return
+
+        self.download_dir = download_dir
+        self.provider_name = provider
+        self.lang = LanguageTypeEnum.DUB if lang_s == "DUB" else LanguageTypeEnum.SUB
+        self.quality = quality
+        self._max_parallel_downloads = parallel
+        self._scheduler_enabled = scheduler_enabled
+        self._scheduler_start = scheduler_start
+        self._scheduler_end = scheduler_end
+        self._integrity_min_mb = integrity_min_mb
+        self._integrity_retry_count = integrity_retry_count
+        self._anilist_enabled = anilist_enabled
+        self._anilist_token = anilist_token
+        self.app_language = app_language
+
+        pidx = self.provider_combo.findData(self.provider_name)
+        if pidx >= 0:
+            self.provider_combo.setCurrentIndex(pidx)
+        self.lang_combo.setCurrentIndex(1 if self.lang == LanguageTypeEnum.DUB else 0)
+        qidx = self.quality_combo.findText(self.quality)
+        if qidx >= 0:
+            self.quality_combo.setCurrentIndex(qidx)
+        self.combo_dl_parallel.setCurrentIndex(self._max_parallel_downloads - 1)
+        self._apply_provider_ui_state()
+        self._apply_app_language_ui()
+        self.refresh_history_ui()
+        self.refresh_offline_library()
+        self.set_status(self._tr("Impostazioni salvate.", "Settings saved."))
+
+    def on_settings_reset(self):
+        defaults = self._default_settings_dict()
+        self.input_settings_download_dir.setText(str(defaults["download_dir"]))
+        pidx = self.combo_settings_provider.findData(defaults["default_provider"])
+        if pidx >= 0:
+            self.combo_settings_provider.setCurrentIndex(pidx)
+        self.combo_settings_lang.setCurrentIndex(0)
+        qidx = self.combo_settings_quality.findData(defaults["default_quality"])
+        if qidx >= 0:
+            self.combo_settings_quality.setCurrentIndex(qidx)
+        didx = self.combo_settings_parallel.findData(defaults["parallel_downloads"])
+        if didx >= 0:
+            self.combo_settings_parallel.setCurrentIndex(didx)
+        sidx = self.combo_settings_scheduler_enabled.findData(defaults["scheduler_enabled"])
+        if sidx >= 0:
+            self.combo_settings_scheduler_enabled.setCurrentIndex(sidx)
+        self.input_settings_scheduler_start.setText(str(defaults["scheduler_start"]))
+        self.input_settings_scheduler_end.setText(str(defaults["scheduler_end"]))
+        self.input_settings_integrity_min_mb.setText(str(defaults["integrity_min_mb"]))
+        ridx = self.combo_settings_integrity_retries.findData(defaults["integrity_retry_count"])
+        if ridx >= 0:
+            self.combo_settings_integrity_retries.setCurrentIndex(ridx)
+        aidx = self.combo_settings_anilist_enabled.findData(defaults["anilist_enabled"])
+        if aidx >= 0:
+            self.combo_settings_anilist_enabled.setCurrentIndex(aidx)
+        lidx = self.combo_settings_app_language.findData(defaults["app_language"])
+        if lidx >= 0:
+            self.combo_settings_app_language.setCurrentIndex(lidx)
+        self.input_settings_anilist_token.setText(str(defaults["anilist_token"]))
+        self.set_status(self._tr("Impostazioni ripristinate ai default (premi Salva).", "Settings reset to defaults (press Save)."))
+
+    @staticmethod
+    def _parse_hhmm(v: str) -> tuple[int, int] | None:
+        m = re.fullmatch(r"(\d{2}):(\d{2})", v.strip())
+        if not m:
+            return None
+        hh = int(m.group(1))
+        mm = int(m.group(2))
+        if hh < 0 or hh > 23 or mm < 0 or mm > 59:
+            return None
+        return hh, mm
+
+    def _is_scheduler_window_open(self) -> bool:
+        if not self._scheduler_enabled:
+            return True
+        s = self._parse_hhmm(self._scheduler_start)
+        e = self._parse_hhmm(self._scheduler_end)
+        if s is None or e is None:
+            return True
+        now = time.localtime()
+        cur = now.tm_hour * 60 + now.tm_min
+        start = s[0] * 60 + s[1]
+        end = e[0] * 60 + e[1]
+        if start <= end:
+            return start <= cur <= end
+        return cur >= start or cur <= end
+
+    def _scheduler_tick(self):
+        if self._scheduler_enabled and self._is_scheduler_window_open():
+            self._start_next_downloads()
+
+    def on_settings_backup(self):
+        default_name = f"anigui_backup_{time.strftime('%Y%m%d_%H%M%S')}.zip"
+        out_path, _ = QFileDialog.getSaveFileName(
+            self,
+            self._tr("Crea backup", "Create backup"),
+            os.path.join(self.download_dir, default_name),
+            self._tr("File zip (*.zip)", "Zip files (*.zip)"),
+        )
+        if not out_path:
+            return
+        if not out_path.lower().endswith(".zip"):
+            out_path += ".zip"
+        try:
+            with zipfile.ZipFile(out_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+                base = app_state_dir()
+                files = [
+                    ("history.json", HISTORY_PATH),
+                    ("search_history.json", SEARCH_HISTORY_PATH),
+                    ("offline_covers.json", OFFLINE_COVERS_MAP_PATH),
+                    ("settings.json", SETTINGS_PATH),
+                    ("favorites.json", FAVORITES_PATH),
+                    ("metadata_cache.json", METADATA_CACHE_PATH),
+                ]
+                for arc, src in files:
+                    if os.path.exists(src):
+                        zf.write(src, arcname=arc)
+                covers_dir = os.path.join(base, "covers")
+                if os.path.isdir(covers_dir):
+                    for fn in os.listdir(covers_dir):
+                        src = os.path.join(covers_dir, fn)
+                        if os.path.isfile(src):
+                            zf.write(src, arcname=os.path.join("covers", fn))
+            self.set_status(f"Backup creato: {out_path}")
+        except Exception as ex:
+            self.notify_err(f"Backup fallito: {ex}")
+
+    def on_settings_restore(self):
+        if self._incognito_enabled:
+            self.set_status("Incognito attivo: restore bloccato.")
+            return
+        in_path, _ = QFileDialog.getOpenFileName(
+            self,
+            self._tr("Ripristina backup", "Restore backup"),
+            self.download_dir,
+            self._tr("File zip (*.zip)", "Zip files (*.zip)"),
+        )
+        if not in_path:
+            return
+        try:
+            with zipfile.ZipFile(in_path, "r") as zf:
+                members = set(zf.namelist())
+                base = app_state_dir()
+                mapping = {
+                    "history.json": HISTORY_PATH,
+                    "search_history.json": SEARCH_HISTORY_PATH,
+                    "offline_covers.json": OFFLINE_COVERS_MAP_PATH,
+                    "settings.json": SETTINGS_PATH,
+                    "favorites.json": FAVORITES_PATH,
+                    "metadata_cache.json": METADATA_CACHE_PATH,
+                }
+                for arc, dst in mapping.items():
+                    if arc in members:
+                        os.makedirs(os.path.dirname(dst), exist_ok=True)
+                        with zf.open(arc, "r") as src, open(dst, "wb") as out:
+                            out.write(src.read())
+                for m in members:
+                    if not m.startswith("covers/") or m.endswith("/"):
+                        continue
+                    rel = m[len("covers/"):]
+                    dst = os.path.join(base, "covers", os.path.basename(rel))
+                    os.makedirs(os.path.dirname(dst), exist_ok=True)
+                    with zf.open(m, "r") as src, open(dst, "wb") as out:
+                        out.write(src.read())
+
+            # reload in-memory data from restored files
+            self.history.load()
+            self.refresh_history_ui()
+            self._settings = self._load_settings()
+            self._apply_runtime_from_settings()
+            self._load_search_history()
+            self._load_offline_covers_map()
+            self._load_favorites()
+            self._load_metadata_cache()
+            self.refresh_favorites_ui()
+            self._sync_settings_ui_from_state()
+            self.refresh_offline_library()
+            self.set_status("Restore completato.")
+        except Exception as ex:
+            self.notify_err(f"Restore fallito: {ex}")
+
+
+    def _load_favorites(self):
+        try:
+            with open(FAVORITES_PATH, "r", encoding="utf-8") as f:
+                raw = json.load(f)
+            if isinstance(raw, list):
+                self._favorite_items = [FavoriteEntry(**x) for x in raw if isinstance(x, dict)]
+            else:
+                self._favorite_items = []
+        except Exception:
+            self._favorite_items = []
+
+    def _save_favorites(self):
+        if self._incognito_enabled:
+            return
+        tmp = FAVORITES_PATH + ".tmp"
+        try:
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump([asdict(x) for x in self._favorite_items], f, ensure_ascii=False, indent=2)
+            os.replace(tmp, FAVORITES_PATH)
+        except Exception:
+            try:
+                if os.path.exists(tmp):
+                    os.remove(tmp)
+            except Exception:
+                pass
+
+    def _favorite_exists(self, source: str, identifier: str) -> bool:
+        for x in self._favorite_items:
+            if x.source == source and x.identifier == identifier:
+                return True
+        return False
+
+    def _add_favorite_from_item(self, item: SearchItem):
+        if self._favorite_exists(item.source, item.identifier):
+            return
+        self._favorite_items.append(
+            FavoriteEntry(
+                name=item.name,
+                identifier=item.identifier,
+                source=item.source,
+                cover_url=item.cover_url,
+                added_at=time.time(),
+            )
+        )
+        self._save_favorites()
+        self.refresh_favorites_ui()
+
+    def refresh_favorites_ui(self):
+        self.favorites_list.clear()
+        if not self._favorite_items:
+            self.favorites_list.addItem(self._tr("(nessun preferito)", "(no favorites)"))
+            self.favorites_list.item(0).setFlags(Qt.ItemFlag.NoItemFlags)
+            return
+        ordered = sorted(self._favorite_items, key=lambda x: x.added_at, reverse=True)
+        self._favorite_items = ordered
+        placeholder = self._make_cover_placeholder()
+        for row, fav in enumerate(self._favorite_items):
+            it = QListWidgetItem(placeholder, fav.name)
+            it.setTextAlignment(Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignTop)
+            it.setSizeHint(QSize(170, 290))
+            self.favorites_list.addItem(it)
+            if fav.cover_url:
+                w = Worker(self.do_fetch_cover, fav.cover_url)
+                w.ok.connect(lambda data, r=row: self._on_favorite_cover_loaded(r, data[0], data[1]))
+                w.err.connect(lambda _msg: None)
+                self._workers.append(w)
+                w.start()
+
+    def _on_favorite_cover_loaded(self, row: int, data: bytes | None, from_cache: bool):
+        if data is None or row < 0 or row >= self.favorites_list.count():
+            return
+        pix = QPixmap()
+        if not pix.loadFromData(data):
+            return
+        if from_cache:
+            pix = self._apply_cached_badge(pix)
+        scaled = pix.scaled(
+            self.favorites_list.iconSize(),
+            Qt.AspectRatioMode.KeepAspectRatioByExpanding,
+            Qt.TransformationMode.SmoothTransformation,
+        )
+        self.favorites_list.item(row).setIcon(QIcon(scaled))
+
+    def on_favorite_add_current(self):
+        if self.selected_search_item is not None:
+            self._add_favorite_from_item(self.selected_search_item)
+            self.set_status("Aggiunto ai preferiti.")
+            return
+        if self.selected_anime is not None:
+            ident = str(
+                getattr(self.selected_anime, "identifier", None)
+                or getattr(self.selected_anime, "_identifier", None)
+                or getattr(self.selected_anime, "ref", "")
+            )
+            item = SearchItem(
+                name=getattr(self.selected_anime, "name", "anime"),
+                identifier=ident,
+                languages={LanguageTypeEnum.SUB, LanguageTypeEnum.DUB},
+                cover_url=getattr(self.selected_search_item, "cover_url", None) if self.selected_search_item else None,
+                source=self.provider_name,
+            )
+            self._add_favorite_from_item(item)
+            self.set_status("Aggiunto ai preferiti.")
+
+    def on_favorite_remove_selected(self):
+        row = self.favorites_list.currentRow()
+        if row < 0 or row >= len(self._favorite_items):
+            return
+        self._favorite_items.pop(row)
+        self._save_favorites()
+        self.refresh_favorites_ui()
+
+    def on_pick_favorite(self, *_args):
+        row = self.favorites_list.currentRow()
+        if row < 0 or row >= len(self._favorite_items):
+            return
+        fav = self._favorite_items[row]
+        item = SearchItem(
+            name=fav.name,
+            identifier=fav.identifier,
+            languages={LanguageTypeEnum.SUB, LanguageTypeEnum.DUB},
+            cover_url=fav.cover_url,
+            source=fav.source,
+        )
+        self._set_provider(item.source)
+        self.selected_search_item = item
+        self.selected_anime = self.build_anime_from_item(item)
+        self.lbl_anime_title.setText(item.name)
+        self.lbl_player_title.setText(item.name)
+        self.tabs.setCurrentWidget(self.tab_search)
+        self.search_stack.setCurrentWidget(self.page_anime)
+        self._current_search_view = "anime"
+        self._refresh_search_layout()
+        self.fetch_episodes()
+
+    def _metadata_cache_ttl_seconds(self) -> float:
+        return 7 * 24 * 3600.0
+
+    def _metadata_key(self, source: str, identifier: str) -> str:
+        return f"{source}:{identifier}"
+
+    def _load_metadata_cache(self):
+        try:
+            with open(METADATA_CACHE_PATH, "r", encoding="utf-8") as f:
+                raw = json.load(f)
+            self._metadata_cache = raw if isinstance(raw, dict) else {}
+        except Exception:
+            self._metadata_cache = {}
+
+    def _save_metadata_cache(self):
+        if self._incognito_enabled:
+            return
+        tmp = METADATA_CACHE_PATH + ".tmp"
+        try:
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(self._metadata_cache, f, ensure_ascii=False, indent=2)
+            os.replace(tmp, METADATA_CACHE_PATH)
+        except Exception:
+            try:
+                if os.path.exists(tmp):
+                    os.remove(tmp)
+            except Exception:
+                pass
+
+    def _apply_metadata_cache_to_item(self, it: SearchItem):
+        key = self._metadata_key(it.source, it.identifier)
+        obj = self._metadata_cache.get(key)
+        if not isinstance(obj, dict):
+            return
+        ts = float(obj.get("updated_at", 0.0) or 0.0)
+        if (time.time() - ts) > self._metadata_cache_ttl_seconds():
+            return
+        if it.year is None:
+            it.year = obj.get("year")
+        if not it.season:
+            it.season = obj.get("season")
+        if not it.studio:
+            it.studio = obj.get("studio")
+        if it.rating is None:
+            it.rating = obj.get("rating")
+
+    def _store_metadata_cache_for_item(self, it: SearchItem):
+        if self._incognito_enabled:
+            return
+        key = self._metadata_key(it.source, it.identifier)
+        self._metadata_cache[key] = {
+            "updated_at": time.time(),
+            "year": it.year,
+            "season": it.season,
+            "studio": it.studio,
+            "rating": it.rating,
+        }
+        self._save_metadata_cache()
+
+    def _load_search_history(self):
+        try:
+            with open(SEARCH_HISTORY_PATH, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, list):
+                self._recent_queries = [str(x) for x in data if str(x).strip()]
+        except FileNotFoundError:
+            self._recent_queries = []
+        except Exception:
+            self._recent_queries = []
+
+    def _save_search_history(self):
+        if self._incognito_enabled:
+            return
+        tmp = SEARCH_HISTORY_PATH + ".tmp"
+        try:
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(self._recent_queries, f, ensure_ascii=False, indent=2)
+            os.replace(tmp, SEARCH_HISTORY_PATH)
+        except Exception:
+            try:
+                if os.path.exists(tmp):
+                    os.remove(tmp)
+            except Exception:
+                pass
+
+    def _load_offline_covers_map(self):
+        try:
+            with open(OFFLINE_COVERS_MAP_PATH, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, dict):
+                loaded = {
+                    str(k): str(v)
+                    for k, v in data.items()
+                    if str(k).strip() and str(v).strip()
+                }
+                changed = False
+                for k, v in list(loaded.items()):
+                    # migrate legacy URL entries to local *.img cache path
+                    if not v.lower().endswith(".img"):
+                        p = self._cover_cache_path(v)
+                        if p and os.path.exists(p):
+                            loaded[k] = p
+                            changed = True
+                self._offline_covers_map = loaded
+                if changed:
+                    self._save_offline_covers_map()
+            else:
+                self._offline_covers_map = {}
+                self._save_offline_covers_map()
+        except FileNotFoundError:
+            self._offline_covers_map = {}
+            self._save_offline_covers_map()
+        except Exception:
+            self._offline_covers_map = {}
+            self._save_offline_covers_map()
+
+    def _save_offline_covers_map(self):
+        if self._incognito_enabled:
+            return
+        tmp = OFFLINE_COVERS_MAP_PATH + ".tmp"
+        try:
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(self._offline_covers_map, f, ensure_ascii=False, indent=2)
+            os.replace(tmp, OFFLINE_COVERS_MAP_PATH)
+        except Exception:
+            try:
+                if os.path.exists(tmp):
+                    os.remove(tmp)
+            except Exception:
+                pass
+
+    def _remember_offline_cover_url(self, anime_name: str, cover_url: str | None):
+        if self._incognito_enabled:
+            return
+        if not cover_url:
+            return
+        cache_path = self._cover_cache_path(cover_url)
+        if not cache_path or not os.path.exists(cache_path):
+            return
+        key = self._safe_name(anime_name).lower()
+        if not key:
+            return
+        if self._offline_covers_map.get(key) == cache_path:
+            return
+        self._offline_covers_map[key] = cache_path
+        self._save_offline_covers_map()
+
+    def _add_recent_query(self, q: str):
+        q = q.strip()
+        if not q:
+            return
+        self._recent_queries = [x for x in self._recent_queries if x.lower() != q.lower()]
+        self._recent_queries.insert(0, q)
+        if not self._incognito_enabled:
+            self._save_search_history()
+        self._refresh_recent_queries_ui()
+
+    def on_clear_search_history(self):
+        self._recent_queries = []
+        if not self._incognito_enabled:
+            try:
+                if os.path.exists(SEARCH_HISTORY_PATH):
+                    os.remove(SEARCH_HISTORY_PATH)
+            except Exception:
+                pass
+        self._refresh_recent_queries_ui()
+
+    def _refresh_recent_queries_ui(self):
+        self.list_recent_queries.clear()
+        if not self._recent_queries:
+            self.list_recent_queries.addItem(self._tr("(nessuna ricerca recente)", "(no recent searches)"))
+            self.list_recent_queries.item(0).setFlags(Qt.ItemFlag.NoItemFlags)
+            return
+        for q in self._recent_queries:
+            self.list_recent_queries.addItem(q)
+
+    def _update_suggestions_visibility(self):
+        empty = not self.search_input.text().strip()
+        self.suggestions_panel.setVisible(self._current_search_view == "catalog" and empty)
+
+    def _set_search_results_area_visible(self, visible: bool):
+        for w in getattr(self, "_search_filter_widgets", []):
+            w.setVisible(visible)
+        self.results.setVisible(visible)
+
+    def _refresh_search_layout(self):
+        self._update_suggestions_visibility()
+        has_query = len(self.search_input.text().strip()) >= 3
+        in_catalog = self._current_search_view == "catalog"
+        self._set_search_results_area_visible(in_catalog and has_query)
+        self.search_stack.setVisible((not in_catalog) or has_query)
+
+
+
+    def on_worker_error(self, msg: str):
+        self._end_request()
+        self.notify_err(msg)
+        self.set_status("Errore.")
+
+    def eventFilter(self, obj, event):
+        if not hasattr(self, "_video_fs_window"):
+            return super().eventFilter(obj, event)
+        if obj is self.seek_slider and event.type() == QEvent.Type.Resize:
+            self._position_resume_marker()
+        if self._is_video_fullscreen() and self._video_fs_window is not None:
+            if isinstance(obj, QWidget) and obj.window() is self._video_fs_window:
+                t = event.type()
+                if t in (
+                    QEvent.Type.MouseMove,
+                    QEvent.Type.MouseButtonPress,
+                    QEvent.Type.MouseButtonRelease,
+                    QEvent.Type.Wheel,
+                    QEvent.Type.KeyPress,
+                    QEvent.Type.KeyRelease,
+                ):
+                    self._fs_mark_active()
+        return super().eventFilter(obj, event)
+
+    def resizeEvent(self, e):
+        super().resizeEvent(e)
+        if hasattr(self, "hist_list"):
+            QTimer.singleShot(0, self._relayout_history_cards)
+
+    def closeEvent(self, e):
+        self._save_current_progress(force=True)
+        for worker in list(self._active_download_workers.values()):
+            try:
+                worker.request_cancel()
+            except Exception:
+                pass
+        for worker in list(self._active_download_workers.values()):
+            try:
+                worker.wait(1200)
+            except Exception:
+                pass
+        try:
+            self.player.stop()
+        except Exception:
+            pass
+        if self._mini_player_window is not None:
+            self._exit_mini_player()
+        if self._is_video_fullscreen():
+            self._exit_video_fullscreen()
+        super().closeEvent(e)
+
+
+def main():
+    debug_log("Application start")
+    app = QApplication(sys.argv)
+    w = MainWindow()
+    w.show()
+    debug_log("Application UI shown, entering event loop")
+    sys.exit(app.exec())
+
+
+if __name__ == "__main__":
+    main()
