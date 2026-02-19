@@ -26,7 +26,7 @@ class UpdateMixin:
         w = Worker(self._update_fetch_manifest_worker)
         w.ok.connect(lambda info, sl=silent: self._on_update_check_ok(info, sl))
         w.err.connect(lambda msg, sl=silent: self._on_update_check_err(msg, sl))
-        self._workers.append(w)
+        self._track_worker(w)
         w.start()
 
     def check_updates_silent(self):
@@ -114,7 +114,7 @@ class UpdateMixin:
         w = Worker(self._download_update_worker, dict(info))
         w.ok.connect(self._on_update_download_ok)
         w.err.connect(self._on_update_download_err)
-        self._workers.append(w)
+        self._track_worker(w)
         w.start()
 
     def _on_update_download_ok(self, path: str):
@@ -196,4 +196,3 @@ class UpdateMixin:
             self.notify_err(self._tr(f"Avvio updater fallito: {ex}", f"Updater launch failed: {ex}"))
             return
         QApplication.instance().quit()
-

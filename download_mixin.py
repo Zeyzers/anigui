@@ -289,7 +289,7 @@ class DownloadMixin:
 
             w.ok.connect(on_ok)
             w.err.connect(on_err)
-            self._workers.append(w)
+            self._track_worker(w)
             w.start()
 
     def _on_download_progress(self, task_id: str, pct: int, downloaded: int, total: int):
@@ -427,4 +427,3 @@ class DownloadMixin:
         except Exception as ex:
             debug_log(f"open-folder: error={ex}")
             self.notify_err(str(ex))
-

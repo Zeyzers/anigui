@@ -198,7 +198,7 @@ class HistoryMixin:
                 w_cover = Worker(self.do_fetch_cover, e.cover_url)
                 w_cover.ok.connect(lambda data, r=list_row: self._on_history_cover_loaded(r, data[0], data[1]))
                 w_cover.err.connect(lambda _msg: None)
-                self._workers.append(w_cover)
+                self._track_worker(w_cover)
                 w_cover.start()
             else:
                 w_cover = Worker(self.do_fetch_cover_for_history_entry, e)
@@ -212,7 +212,7 @@ class HistoryMixin:
                     )
                 )
                 w_cover.err.connect(lambda _msg: None)
-                self._workers.append(w_cover)
+                self._track_worker(w_cover)
                 w_cover.start()
         self._relayout_history_cards()
         QTimer.singleShot(0, self._relayout_history_cards)
@@ -503,7 +503,7 @@ class HistoryMixin:
         w = Worker(self.do_episodes, self.selected_anime)
         w.ok.connect(after_eps)
         w.err.connect(self.on_worker_error)
-        self._workers.append(w)
+        self._track_worker(w)
         w.start()
 
     def on_history_resume_next(self):

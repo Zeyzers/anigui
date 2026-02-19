@@ -79,7 +79,7 @@ class PlayerMixin:
 
         w.ok.connect(on_ok)
         w.err.connect(on_err)
-        self._workers.append(w)
+        self._track_worker(w)
         w.start()
 
 

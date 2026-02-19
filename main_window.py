@@ -1046,6 +1046,21 @@ class MainWindow(PlayerMixin, SearchMixin, DownloadMixin, UpdateMixin, HistoryMi
     def set_status(self, msg: str):
         self.status.setText(self._localize_runtime_text(str(msg)))
 
+    def _track_worker(self, w: QThread):
+        self._workers.append(w)
+
+        def _cleanup_worker():
+            try:
+                self._workers.remove(w)
+            except ValueError:
+                pass
+            try:
+                w.deleteLater()
+            except Exception:
+                pass
+
+        w.finished.connect(_cleanup_worker)
+
     def _tr(self, it: str, en: str) -> str:
         return en if self.app_language == "en" else it
 
@@ -1576,7 +1591,7 @@ class MainWindow(PlayerMixin, SearchMixin, DownloadMixin, UpdateMixin, HistoryMi
 
         w.ok.connect(on_ok)
         w.err.connect(on_err)
-        self._workers.append(w)
+        self._track_worker(w)
         w.start()
 
     def _anilist_sync_worker(
@@ -2016,7 +2031,7 @@ class MainWindow(PlayerMixin, SearchMixin, DownloadMixin, UpdateMixin, HistoryMi
 
         w.ok.connect(on_ok)
         w.err.connect(on_err)
-        self._workers.append(w)
+        self._track_worker(w)
         w.start()
 
     def on_anilist_sync_now(self):
@@ -2100,7 +2115,7 @@ class MainWindow(PlayerMixin, SearchMixin, DownloadMixin, UpdateMixin, HistoryMi
 
         w.ok.connect(on_ok)
         w.err.connect(on_err)
-        self._workers.append(w)
+        self._track_worker(w)
         w.start()
 
     def _history_entry_for_sync_now(self) -> HistoryEntry | None:
@@ -2256,7 +2271,7 @@ class MainWindow(PlayerMixin, SearchMixin, DownloadMixin, UpdateMixin, HistoryMi
 
         w.ok.connect(on_ok)
         w.err.connect(on_err)
-        self._workers.append(w)
+        self._track_worker(w)
         w.start()
 
 
@@ -2328,7 +2343,7 @@ class MainWindow(PlayerMixin, SearchMixin, DownloadMixin, UpdateMixin, HistoryMi
                 w = Worker(self._offline_cover_cached_only, it.cover_url)
                 w.ok.connect(lambda data, r=row, n=nonce: self._on_offline_cover_loaded(r, n, data[0], data[1]))
                 w.err.connect(lambda _msg: None)
-                self._workers.append(w)
+                self._track_worker(w)
                 w.start()
 
     def on_pick_offline_anime(self):
@@ -3562,7 +3577,7 @@ class MainWindow(PlayerMixin, SearchMixin, DownloadMixin, UpdateMixin, HistoryMi
                 w = Worker(self.do_fetch_cover, fav.cover_url)
                 w.ok.connect(lambda data, r=row: self._on_favorite_cover_loaded(r, data[0], data[1]))
                 w.err.connect(lambda _msg: None)
-                self._workers.append(w)
+                self._track_worker(w)
                 w.start()
 
     def _on_favorite_cover_loaded(self, row: int, data: bytes | None, from_cache: bool):
@@ -3867,6 +3882,19 @@ class MainWindow(PlayerMixin, SearchMixin, DownloadMixin, UpdateMixin, HistoryMi
                 worker.wait(1200)
             except Exception:
                 pass
+        for worker in list(self._workers):
+            try:
+                if hasattr(worker, "request_cancel"):
+                    worker.request_cancel()
+            except Exception:
+                pass
+        for worker in list(self._workers):
+            try:
+                if worker.isRunning():
+                    worker.wait(1200)
+            except Exception:
+                pass
+        self._workers.clear()
         try:
             self.player.stop()
         except Exception:

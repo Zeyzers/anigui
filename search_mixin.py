@@ -701,7 +701,7 @@ class SearchMixin:
             w = Worker(self.do_fetch_cover_for_item, it)
             w.ok.connect(lambda data, r=row, n=nonce: on_cover(r, n, data[0], data[1]))
             w.err.connect(lambda _msg: None)
-            self._workers.append(w)
+            self._track_worker(w)
             w.start()
 
         self._start_skeletons()
@@ -835,7 +835,7 @@ class SearchMixin:
         w = Worker(self.do_search, q)
         w.ok.connect(lambda items, n=nonce, q=q: self.on_search_results(n, q, items))
         w.err.connect(self.on_worker_error)
-        self._workers.append(w)
+        self._track_worker(w)
         w.start()
 
     def on_refresh_recommended(self):
@@ -892,8 +892,8 @@ class SearchMixin:
         w_recent.err.connect(self.on_worker_error)
         w.ok.connect(on_ok)
         w.err.connect(self.on_worker_error)
-        self._workers.append(w_recent)
-        self._workers.append(w)
+        self._track_worker(w_recent)
+        self._track_worker(w)
         w_recent.start()
         w.start()
 
@@ -1028,7 +1028,7 @@ class SearchMixin:
         w = Worker(self._enrich_items_worker, items)
         w.ok.connect(lambda enriched, n=enrich_nonce, sn=nonce: self._on_items_enriched(n, sn, enriched))
         w.err.connect(lambda _msg: None)
-        self._workers.append(w)
+        self._track_worker(w)
         w.start()
 
     def _enrich_items_worker(self, items: list[SearchItem]) -> list[SearchItem]:
@@ -1138,7 +1138,7 @@ class SearchMixin:
         w = Worker(self.do_episodes, self.selected_anime)
         w.ok.connect(self.on_episodes_ready)
         w.err.connect(self.on_worker_error)
-        self._workers.append(w)
+        self._track_worker(w)
         w.start()
 
     def on_episodes_ready(self, eps: list[float | int]):
@@ -1209,4 +1209,3 @@ class SearchMixin:
         self.play_episode(ep)
 
     # ---------------- History tab ----------------
-
