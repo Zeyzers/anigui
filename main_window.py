@@ -17,6 +17,8 @@ import hashlib
 import importlib
 import re
 import zipfile
+import random
+from collections import defaultdict
 from dataclasses import asdict
 from typing import Optional, Any, Callable
 import errno
@@ -112,6 +114,7 @@ class MainWindow(PlayerMixin, SearchMixin, DownloadMixin, UpdateMixin, HistoryMi
         self._init_settings_and_runtime()
         self._build_search_and_player_ui()
         self._build_recommended_tab()
+        self._build_featured_tab()
         self._build_downloads_tab()
         self._build_offline_tab()
         self._build_favorites_tab()
@@ -386,6 +389,12 @@ class MainWindow(PlayerMixin, SearchMixin, DownloadMixin, UpdateMixin, HistoryMi
         self.btn_fav_anime = QPushButton("❤ Favorite")
         self.btn_fav_anime.clicked.connect(self.on_favorite_add_current)
         anime_header.addWidget(self.btn_fav_anime, 0)
+        self.btn_mark_planned_anime = QPushButton("📝 Planned")
+        self.btn_mark_planned_anime.clicked.connect(self.on_mark_anime_planned)
+        anime_header.addWidget(self.btn_mark_planned_anime, 0)
+        self.btn_mark_completed_anime = QPushButton("✅ Completed")
+        self.btn_mark_completed_anime.clicked.connect(self.on_mark_anime_completed)
+        anime_header.addWidget(self.btn_mark_completed_anime, 0)
         anime_layout.addLayout(anime_header)
 
         self.episodes = QListWidget()
@@ -541,6 +550,34 @@ class MainWindow(PlayerMixin, SearchMixin, DownloadMixin, UpdateMixin, HistoryMi
         rec_split.addWidget(recommended_col)
         rec_split.setStretchFactor(0, 1)
         rec_split.setStretchFactor(1, 1)
+
+    def _build_featured_tab(self):
+        self.tab_featured = QWidget()
+        self.tabs.addTab(self.tab_featured, "Featured")
+        feat_layout = QVBoxLayout(self.tab_featured)
+
+        feat_top = QHBoxLayout()
+        self.lbl_featured_header = QLabel("Featured for You")
+        self.lbl_featured_header.setObjectName("featuredHeader")
+        self.lbl_featured_header.setToolTip(self._featured_algorithm_tooltip())
+        feat_top.addWidget(self.lbl_featured_header, 1)
+        self.btn_refresh_featured = QPushButton("↻ Aggiorna")
+        self.btn_refresh_featured.clicked.connect(lambda: self.on_refresh_featured(force=True))
+        self.btn_refresh_featured.setToolTip(self._featured_algorithm_tooltip())
+        feat_top.addWidget(self.btn_refresh_featured, 0)
+        feat_layout.addLayout(feat_top)
+
+        self.featured = QListWidget()
+        self.featured.itemClicked.connect(self.on_pick_featured)
+        self.featured.setViewMode(QListView.ViewMode.IconMode)
+        self.featured.setResizeMode(QListView.ResizeMode.Adjust)
+        self.featured.setMovement(QListView.Movement.Static)
+        self.featured.setWrapping(True)
+        self.featured.setSpacing(14)
+        self.featured.setIconSize(QSize(150, 220))
+        self.featured.setWordWrap(True)
+        self.featured.setToolTip(self._featured_algorithm_tooltip())
+        feat_layout.addWidget(self.featured, 1)
 
     def _build_downloads_tab(self):
         # ---- Downloads tab ----
@@ -892,6 +929,10 @@ class MainWindow(PlayerMixin, SearchMixin, DownloadMixin, UpdateMixin, HistoryMi
         self._recent_cards: list[QListWidgetItem] = []
         self._recommended_items: list[SearchItem] = []
         self._recommended_cards: list[QListWidgetItem] = []
+        self._featured_items: list[SearchItem] = []
+        self._featured_cards: list[QListWidgetItem] = []
+        self._featured_cache: dict[str, dict[str, Any]] = {}
+        self._featured_provider_search_cache: dict[str, tuple[float, list[SearchItem]]] = {}
         self._favorite_items: list[FavoriteEntry] = []
         self._metadata_cache: dict[str, dict[str, Any]] = {}
         self._download_tasks: dict[str, DownloadTask] = {}
@@ -902,7 +943,9 @@ class MainWindow(PlayerMixin, SearchMixin, DownloadMixin, UpdateMixin, HistoryMi
         self._search_nonce = 0
         self._recent_nonce = 0
         self._recommended_nonce = 0
+        self._featured_nonce = 0
         self._recommended_loaded = False
+        self._featured_loaded = False
         self._current_search_view = "catalog"
         self._recent_queries: list[str] = []
         self._offline_covers_map: dict[str, str] = {}
@@ -988,6 +1031,7 @@ class MainWindow(PlayerMixin, SearchMixin, DownloadMixin, UpdateMixin, HistoryMi
         self._apply_app_language_ui()
         self.recent.setObjectName("resultsList")
         self.recommended.setObjectName("resultsList")
+        self.featured.setObjectName("resultsList")
         self.refresh_history_ui()
         self.tabs.currentChanged.connect(self.on_tab_changed)
 
@@ -999,6 +1043,7 @@ class MainWindow(PlayerMixin, SearchMixin, DownloadMixin, UpdateMixin, HistoryMi
         self._refresh_recent_queries_ui()
         self._update_suggestions_visibility()
         self._refresh_search_layout()
+        self._update_featured_tab_visibility()
         self.refresh_offline_library()
         self.refresh_favorites_ui()
         QTimer.singleShot(1200, self.check_updates_silent)
@@ -1063,6 +1108,28 @@ class MainWindow(PlayerMixin, SearchMixin, DownloadMixin, UpdateMixin, HistoryMi
 
     def _tr(self, it: str, en: str) -> str:
         return en if self.app_language == "en" else it
+
+    def _featured_algorithm_tooltip(self) -> str:
+        return self._tr(
+            "Questa lista usa AniList: calcola i tuoi generi piu guardati (pesando stato, progresso e score), "
+            "cerca titoli affini, esclude quelli gia visti e ordina i risultati per match generi/popolarita/valutazione.",
+            "This list uses AniList: it derives your most watched genres (weighted by status, progress and score), "
+            "finds similar titles, excludes already watched ones, and ranks results by genre match/popularity/score.",
+        )
+
+    def _is_featured_tab_enabled(self) -> bool:
+        return bool(self._anilist_enabled and self._normalize_anilist_token(self._anilist_token))
+
+    def _update_featured_tab_visibility(self):
+        if not hasattr(self, "tabs") or not hasattr(self, "tab_featured"):
+            return
+        idx = self.tabs.indexOf(self.tab_featured)
+        if idx < 0:
+            return
+        visible = self._is_featured_tab_enabled()
+        self.tabs.setTabVisible(idx, visible)
+        if not visible and self.tabs.currentWidget() is self.tab_featured:
+            self.tabs.setCurrentWidget(self.tab_recommended)
 
     def _translate_literal(self, text: str) -> str:
         if not text:
@@ -1279,6 +1346,7 @@ class MainWindow(PlayerMixin, SearchMixin, DownloadMixin, UpdateMixin, HistoryMi
         # Tabs
         self.tabs.setTabText(self.tabs.indexOf(self.tab_search), self._tr("Cerca", "Search"))
         self.tabs.setTabText(self.tabs.indexOf(self.tab_recommended), self._tr("Consigliati", "Recommended"))
+        self.tabs.setTabText(self.tabs.indexOf(self.tab_featured), self._tr("In primo piano", "Featured"))
         self.tabs.setTabText(self.tabs.indexOf(self.tab_downloads), self._tr("Download", "Downloads"))
         self.tabs.setTabText(self.tabs.indexOf(self.tab_offline), "Offline")
         self.tabs.setTabText(self.tabs.indexOf(self.tab_favorites), self._tr("Preferiti", "Favorites"))
@@ -1295,6 +1363,8 @@ class MainWindow(PlayerMixin, SearchMixin, DownloadMixin, UpdateMixin, HistoryMi
         self.btn_back_catalog.setText(self._tr("← Torna alla ricerca", "← Back to Search"))
         self.btn_queue_selected_eps.setText(self._tr("⬇ Metti in coda selezionati", "⬇ Queue selected"))
         self.btn_fav_anime.setText(self._tr("❤ Preferito", "❤ Favorite"))
+        self.btn_mark_planned_anime.setText(self._tr("📝 Da iniziare", "📝 Planned"))
+        self.btn_mark_completed_anime.setText(self._tr("✅ Completato", "✅ Completed"))
         self.btn_back_episodes.setText(self._tr("← Torna agli episodi", "← Back to Episodes"))
         self.btn_prev.setText(self._tr("⏮ Precedente", "⏮ Prev"))
         self.btn_playpause.setText(self._tr("⏯ Play/Pause", "⏯ Play/Pause"))
@@ -1308,6 +1378,11 @@ class MainWindow(PlayerMixin, SearchMixin, DownloadMixin, UpdateMixin, HistoryMi
         self.lbl_recommended.setText(self._tr("Uscite recenti + Consigliati", "Recent Releases + Recommended"))
         self.lbl_recent_header.setText(self._tr("Uscite recenti", "Recent Releases"))
         self.lbl_recommended_header.setText(self._tr("Consigliati", "Recommended"))
+        self.lbl_featured_header.setText(self._tr("In primo piano per te", "Featured for You"))
+        self.lbl_featured_header.setToolTip(self._featured_algorithm_tooltip())
+        self.btn_refresh_featured.setText(self._tr("↻ Aggiorna", "↻ Refresh"))
+        self.btn_refresh_featured.setToolTip(self._featured_algorithm_tooltip())
+        self.featured.setToolTip(self._featured_algorithm_tooltip())
 
         # Downloads / offline / favorites
         self.btn_dl_open.setText(self._tr("📂 Apri cartella", "📂 Open folder"))
@@ -1547,8 +1622,14 @@ class MainWindow(PlayerMixin, SearchMixin, DownloadMixin, UpdateMixin, HistoryMi
 
     @staticmethod
     def _anilist_status_for_entry(entry: HistoryEntry) -> str:
-        # Episode-complete sync should not mark the whole series as completed.
-        return "CURRENT"
+        prog = 0
+        try:
+            prog = int(max(0.0, float(entry.last_ep)))
+        except Exception:
+            prog = 0
+        if bool(entry.completed) or prog > 0 or bool(entry.watched_eps):
+            return "CURRENT"
+        return "PLANNING"
 
     def _anilist_sync_key(self, entry: HistoryEntry) -> str:
         return f"{entry.provider}:{entry.identifier}:{entry.lang}"
@@ -1560,14 +1641,18 @@ class MainWindow(PlayerMixin, SearchMixin, DownloadMixin, UpdateMixin, HistoryMi
             return
         if not (self._anilist_token or "").strip():
             return
-        if not bool(entry.completed):
-            return
-        progress = int(max(1, float(entry.last_ep)))
+        status = self._anilist_status_for_entry(entry)
+        try:
+            progress = int(max(0.0, float(entry.last_ep)))
+        except Exception:
+            progress = 0
+        if status == "CURRENT" and progress <= 0:
+            progress = 1
         key = self._anilist_sync_key(entry)
         prev = int(self._anilist_last_synced_progress.get(key, 0))
         now = time.time()
         if not force:
-            if progress <= prev:
+            if status == "CURRENT" and progress <= prev:
                 return
             if now - float(self._anilist_last_sync_ts.get(key, 0.0)) < 20.0:
                 return
@@ -1576,14 +1661,17 @@ class MainWindow(PlayerMixin, SearchMixin, DownloadMixin, UpdateMixin, HistoryMi
             self._anilist_sync_worker,
             entry.name,
             progress,
-            self._anilist_status_for_entry(entry),
+            status,
             self._anilist_token,
         )
 
-        def on_ok(_res: object, k=key, p=progress):
-            self._anilist_last_synced_progress[k] = max(
-                p, int(self._anilist_last_synced_progress.get(k, 0))
-            )
+        def on_ok(_res: object, k=key, p=progress, st=status):
+            if st == "CURRENT":
+                self._anilist_last_synced_progress[k] = max(
+                    p, int(self._anilist_last_synced_progress.get(k, 0))
+                )
+            else:
+                self._anilist_last_synced_progress[k] = 0
             self._anilist_last_sync_ts[k] = time.time()
 
         def on_err(msg: str):
@@ -1601,7 +1689,7 @@ class MainWindow(PlayerMixin, SearchMixin, DownloadMixin, UpdateMixin, HistoryMi
         status: str,
         token: str | None = None,
     ) -> dict[str, Any]:
-        cache_key = anime_name.strip().lower()
+        cache_key = self._norm_title(anime_name)
         media_id = self._anilist_media_id_cache.get(cache_key)
         if media_id is None:
             q = """
@@ -1634,7 +1722,7 @@ class MainWindow(PlayerMixin, SearchMixin, DownloadMixin, UpdateMixin, HistoryMi
             {
                 "mediaId": int(media_id),
                 "status": status,
-                "progress": int(max(1, progress)),
+                "progress": int(max(0 if str(status).upper() == "PLANNING" else 1, progress)),
             },
             token=token,
         )
@@ -1827,6 +1915,267 @@ class MainWindow(PlayerMixin, SearchMixin, DownloadMixin, UpdateMixin, HistoryMi
                 )
         return out
 
+    def _anilist_featured_recommendations_worker(
+        self,
+        token: str,
+        provider_name: str,
+        lang_name: str,
+        refresh_salt: int = 0,
+    ) -> list[SearchItem]:
+        lang = LanguageTypeEnum.DUB if lang_name == "DUB" else LanguageTypeEnum.SUB
+        q = """
+        query {
+          Viewer { id }
+        }
+        """
+        payload_viewer = self._anilist_graphql(q, {}, token=token)
+        viewer = payload_viewer.get("data", {}).get("Viewer") if isinstance(payload_viewer.get("data"), dict) else None
+        if not isinstance(viewer, dict) or not viewer.get("id"):
+            raise RuntimeError("Impossibile leggere Viewer AniList.")
+        user_id = int(viewer["id"])
+
+        q_lists = """
+        query ($userId: Int) {
+          MediaListCollection(
+            userId: $userId,
+            type: ANIME,
+            status_in: [CURRENT, REPEATING, COMPLETED, PAUSED, DROPPED, PLANNING]
+          ) {
+            lists {
+              status
+              entries {
+                progress
+                score
+                media {
+                  id
+                  genres
+                  title { romaji english native }
+                }
+              }
+            }
+          }
+        }
+        """
+        payload_lists = self._anilist_graphql(q_lists, {"userId": user_id}, token=token)
+        coll = (
+            payload_lists.get("data", {}).get("MediaListCollection")
+            if isinstance(payload_lists.get("data"), dict)
+            else None
+        )
+        lists = coll.get("lists", []) if isinstance(coll, dict) else []
+        excluded_media_ids: set[int] = set()
+        genre_weights: dict[str, float] = defaultdict(float)
+        status_weight = {
+            "COMPLETED": 1.8,
+            "REPEATING": 1.6,
+            "CURRENT": 1.4,
+            "PAUSED": 0.8,
+            "DROPPED": 0.3,
+            "PLANNING": 0.0,
+        }
+        local_excluded_titles: set[str] = set()
+        for e in self.history._data:
+            n = self._norm_title(getattr(e, "name", ""))
+            if n:
+                # Exclude both already watched and already planned local entries.
+                local_excluded_titles.add(n)
+
+        for lst in lists:
+            if not isinstance(lst, dict):
+                continue
+            remote_status = str(lst.get("status") or "").upper()
+            base_w = float(status_weight.get(remote_status, 0.0))
+            for entry in (lst.get("entries") or []):
+                if not isinstance(entry, dict):
+                    continue
+                media = entry.get("media") if isinstance(entry.get("media"), dict) else {}
+                media_id = int(media.get("id") or 0) if isinstance(media.get("id"), (int, float, str)) else 0
+                if media_id > 0 and remote_status in ("CURRENT", "REPEATING", "COMPLETED", "PAUSED", "DROPPED", "PLANNING"):
+                    excluded_media_ids.add(media_id)
+                progress = int(entry.get("progress") or 0)
+                progress_w = min(24.0, max(0.0, float(progress))) / 24.0
+                score_val = float(entry.get("score") or 0.0)
+                score_w = 0.0
+                if score_val > 0:
+                    if score_val > 10.0:
+                        score_w = min(1.0, score_val / 100.0)
+                    else:
+                        score_w = min(1.0, score_val / 10.0)
+                total_w = base_w + (progress_w * 0.8) + (score_w * 0.6)
+                for g in (media.get("genres") or []):
+                    g_s = str(g or "").strip()
+                    if g_s and total_w > 0.0:
+                        genre_weights[g_s] += total_w
+
+        top_genres = sorted(
+            [(g, w) for g, w in genre_weights.items() if w > 0.0],
+            key=lambda x: x[1],
+            reverse=True,
+        )[:4]
+        if not top_genres:
+            return []
+        top_genre_weights = {g: w for g, w in top_genres}
+
+        q_media = """
+        query ($genres: [String], $page: Int, $perPage: Int) {
+          Page(page: $page, perPage: $perPage) {
+            media(
+              type: ANIME,
+              genre_in: $genres,
+              isAdult: false,
+              sort: [POPULARITY_DESC, SCORE_DESC]
+            ) {
+              id
+              popularity
+              averageScore
+              genres
+              title { romaji english native }
+              coverImage { large medium }
+            }
+          }
+        }
+        """
+        candidates: dict[int, dict[str, Any]] = {}
+        genres_param = [g for g, _w in top_genres]
+        for page in (1, 2, 3):
+            payload_page = self._anilist_graphql(
+                q_media,
+                {"genres": genres_param, "page": page, "perPage": 32},
+                token=token,
+            )
+            page_node = payload_page.get("data", {}).get("Page") if isinstance(payload_page.get("data"), dict) else None
+            media_list = page_node.get("media", []) if isinstance(page_node, dict) else []
+            for media in media_list:
+                if not isinstance(media, dict):
+                    continue
+                mid = int(media.get("id") or 0) if isinstance(media.get("id"), (int, float, str)) else 0
+                if mid <= 0 or mid in excluded_media_ids:
+                    continue
+                title = media.get("title") if isinstance(media.get("title"), dict) else {}
+                titles = [
+                    str(title.get("english") or "").strip(),
+                    str(title.get("romaji") or "").strip(),
+                    str(title.get("native") or "").strip(),
+                ]
+                titles = [t for t in titles if t]
+                if not titles:
+                    continue
+                norm_titles = [self._norm_title(t) for t in titles if self._norm_title(t)]
+                if any(t in local_excluded_titles for t in norm_titles):
+                    continue
+                media_genres = [str(x).strip() for x in (media.get("genres") or []) if str(x).strip()]
+                genre_match_score = sum(top_genre_weights.get(g, 0.0) for g in media_genres)
+                if genre_match_score <= 0.0:
+                    continue
+                match_count = sum(1 for g in media_genres if g in top_genre_weights)
+                popularity = float(media.get("popularity") or 0.0)
+                avg_score = float(media.get("averageScore") or 0.0)
+                rank_score = genre_match_score
+                rank_score += min(1.0, popularity / 300000.0) * 0.9
+                rank_score += min(1.0, avg_score / 100.0) * 1.1
+                if match_count >= 2:
+                    rank_score += 0.7
+                cover = media.get("coverImage") if isinstance(media.get("coverImage"), dict) else {}
+                cover_url = str(cover.get("large") or cover.get("medium") or "").strip() or None
+                prev = candidates.get(mid)
+                if prev is None or float(prev.get("rank_score", 0.0)) < rank_score:
+                    candidates[mid] = {
+                        "titles": titles,
+                        "rank_score": rank_score,
+                        "cover_url": cover_url,
+                        "media_id": mid,
+                    }
+                # warm cache for fast AniList sync later
+                for t in titles:
+                    nt = self._norm_title(t)
+                    if nt and nt not in self._anilist_media_id_cache:
+                        self._anilist_media_id_cache[nt] = mid
+
+        ranked = sorted(candidates.values(), key=lambda x: float(x.get("rank_score", 0.0)), reverse=True)[:220]
+        if int(refresh_salt) != 0:
+            rng = random.Random(int(refresh_salt))
+            diversified: list[dict[str, Any]] = []
+            for c in ranked:
+                base = float(c.get("rank_score", 0.0))
+                jitter = (rng.random() - 0.5) * 0.55
+                x = dict(c)
+                x["rank_score"] = base + jitter
+                diversified.append(x)
+            ranked = sorted(diversified, key=lambda x: float(x.get("rank_score", 0.0)), reverse=True)
+
+        out: list[SearchItem] = []
+        seen_ident: set[str] = set()
+        target_count = 40
+        provider_lookup_budget = 180
+        cache_ttl = 30 * 60
+        now_ts = time.time()
+
+        def provider_search_cached(query: str, strict_lang: bool = True) -> list[SearchItem]:
+            qn = self._norm_title(query)
+            if not qn:
+                return []
+            key = f"{provider_name}|{lang_name}|{1 if strict_lang else 0}|{qn}"
+            cached = self._featured_provider_search_cache.get(key)
+            if cached is not None:
+                ts, items = cached
+                if now_ts - float(ts) <= cache_ttl:
+                    return items
+            try:
+                items = self._search_items_for_provider(query, provider_name, lang, strict_lang=strict_lang)
+            except Exception:
+                items = []
+            if len(self._featured_provider_search_cache) > 2500:
+                self._featured_provider_search_cache.clear()
+            self._featured_provider_search_cache[key] = (now_ts, items)
+            return items
+
+        for cand in ranked:
+            if len(out) >= target_count or provider_lookup_budget <= 0:
+                break
+            titles = list(cand.get("titles") or [])
+            if not titles:
+                continue
+            # prefer english/romaji and avoid duplicate provider hits
+            ordered_titles = []
+            seen_t: set[str] = set()
+            for t in titles:
+                nt = self._norm_title(t)
+                if nt and nt not in seen_t:
+                    seen_t.add(nt)
+                    ordered_titles.append(t)
+            found: SearchItem | None = None
+            # try strict on first 2 titles max
+            for t in ordered_titles[:2]:
+                if provider_lookup_budget <= 0:
+                    break
+                provider_lookup_budget -= 1
+                items = provider_search_cached(t, strict_lang=True)
+                found = self._pick_best_item_for_titles(titles, items)
+                if found is not None:
+                    break
+            if found is None:
+                for t in ordered_titles[:1]:
+                    if provider_lookup_budget <= 0:
+                        break
+                    provider_lookup_budget -= 1
+                    items = provider_search_cached(t, strict_lang=False)
+                    found = self._pick_best_item_for_titles(titles, items)
+                    if found is not None:
+                        break
+            if found is None:
+                continue
+            n_found = self._norm_title(found.name)
+            if n_found and n_found in local_excluded_titles:
+                continue
+            uniq = f"{found.source}:{found.identifier}"
+            if uniq in seen_ident:
+                continue
+            seen_ident.add(uniq)
+            if not found.cover_url:
+                found.cover_url = cand.get("cover_url")
+            out.append(found)
+        return out
+
     def _anilist_pull_worker(
         self,
         token: str,
@@ -1835,6 +2184,31 @@ class MainWindow(PlayerMixin, SearchMixin, DownloadMixin, UpdateMixin, HistoryMi
     ) -> dict[str, Any]:
         lang = LanguageTypeEnum.DUB if lang_name == "DUB" else LanguageTypeEnum.SUB
         rows = self._anilist_fetch_progress_entries(token)
+        search_cache: dict[tuple[str, bool], list[SearchItem]] = {}
+        history_name_idx: dict[str, HistoryEntry] = {}
+        for e in self.history._data:
+            if e.provider != provider_name or e.lang != lang_name:
+                continue
+            n = self._norm_title(e.name)
+            if not n:
+                continue
+            prev = history_name_idx.get(n)
+            if prev is None or float(getattr(prev, "updated_at", 0.0) or 0.0) < float(getattr(e, "updated_at", 0.0) or 0.0):
+                history_name_idx[n] = e
+
+        def provider_search_cached(query: str, strict_lang: bool = True) -> list[SearchItem]:
+            key = ((query or "").strip().casefold(), bool(strict_lang))
+            if not key[0]:
+                return []
+            if key in search_cache:
+                return search_cache[key]
+            try:
+                items = self._search_items_for_provider(query, provider_name, lang, strict_lang=strict_lang)
+            except Exception:
+                items = []
+            search_cache[key] = items
+            return items
+
         seen_ident: set[str] = set()
         built: list[HistoryEntry] = []
         skipped = 0
@@ -1849,6 +2223,11 @@ class MainWindow(PlayerMixin, SearchMixin, DownloadMixin, UpdateMixin, HistoryMi
             media_id = int(row.get("media_id") or 0)
             entry_id = int(row.get("entry_id") or 0)
             remote_status = str(row.get("status") or "").upper()
+            if media_id > 0:
+                for t in titles:
+                    nt = self._norm_title(t)
+                    if nt and nt not in self._anilist_media_id_cache:
+                        self._anilist_media_id_cache[nt] = media_id
             planned_key = ""
             if remote_status == "PLANNING":
                 if media_id > 0:
@@ -1863,19 +2242,32 @@ class MainWindow(PlayerMixin, SearchMixin, DownloadMixin, UpdateMixin, HistoryMi
                     planned_all_seen.add(planned_key)
                     planned_all_keys.append(planned_key)
             found: SearchItem | None = None
+            # Fast-path: if already imported locally for this provider/lang, skip provider network search.
             for t in titles:
-                items = self._search_items_for_provider(t, provider_name, lang)
+                nt = self._norm_title(t)
+                if not nt:
+                    continue
+                existing_local = history_name_idx.get(nt)
+                if existing_local is not None and not str(existing_local.identifier).startswith("planned:"):
+                    found = SearchItem(
+                        name=existing_local.name,
+                        identifier=existing_local.identifier,
+                        languages={LanguageTypeEnum.DUB if lang_name == "DUB" else LanguageTypeEnum.SUB},
+                        cover_url=existing_local.cover_url,
+                        source=provider_name,
+                        raw=None,
+                    )
+                    break
+            for t in titles:
+                if found is not None:
+                    break
+                items = provider_search_cached(t, strict_lang=True)
                 found = self._pick_best_item_for_titles(titles, items)
                 if found is not None:
                     break
             if found is None and remote_status == "PLANNING":
                 for t in titles:
-                    items = self._search_items_for_provider(
-                        t,
-                        provider_name,
-                        lang,
-                        strict_lang=False,
-                    )
+                    items = provider_search_cached(t, strict_lang=False)
                     found = self._pick_best_item_for_titles(titles, items)
                     if found is not None:
                         break
@@ -2046,6 +2438,7 @@ class MainWindow(PlayerMixin, SearchMixin, DownloadMixin, UpdateMixin, HistoryMi
         anime_name: str | None = None
         progress = 0
         completed = False
+        status = "CURRENT"
         source = "none"
 
         if self.selected_anime is not None and self.current_ep is not None:
@@ -2072,6 +2465,8 @@ class MainWindow(PlayerMixin, SearchMixin, DownloadMixin, UpdateMixin, HistoryMi
             if e is not None:
                 anime_name = e.name
                 progress, completed = self._history_entry_best_progress_and_completed_for_sync(e)
+                if not completed and progress <= 0:
+                    status = "PLANNING"
                 source = "history"
 
         debug_log(
@@ -2082,9 +2477,9 @@ class MainWindow(PlayerMixin, SearchMixin, DownloadMixin, UpdateMixin, HistoryMi
         fail_reason = ""
         if not anime_name:
             fail_reason = "no-anime"
-        elif int(progress) <= 0:
+        elif status == "CURRENT" and int(progress) <= 0:
             fail_reason = "no-progress"
-        elif not bool(completed):
+        elif status == "CURRENT" and not bool(completed):
             fail_reason = "not-completed"
 
         if fail_reason:
@@ -2099,14 +2494,19 @@ class MainWindow(PlayerMixin, SearchMixin, DownloadMixin, UpdateMixin, HistoryMi
                 self.set_status("Sincronizza ora: episodio non completato, sync non inviato.")
             return
 
-        status = "CURRENT"
-        self.set_status(f"Sincronizzazione AniList: {anime_name} ep {progress}…")
+        if status == "PLANNING":
+            self.set_status(f"Sincronizzazione AniList: {anime_name} -> Planned…")
+        else:
+            self.set_status(f"Sincronizzazione AniList: {anime_name} ep {progress}…")
         self._begin_request()
         w = Worker(self._anilist_sync_worker, anime_name, progress, status, token)
 
-        def on_ok(_data: object, name=anime_name, ep=progress):
+        def on_ok(_data: object, name=anime_name, ep=progress, st=status):
             self._end_request()
-            self.set_status(f"Sincronizzazione AniList ok: {name} ep {ep}")
+            if st == "PLANNING":
+                self.set_status(f"Sincronizzazione AniList ok: {name} (Planned)")
+            else:
+                self.set_status(f"Sincronizzazione AniList ok: {name} ep {ep}")
 
         def on_err(msg: str):
             self._end_request()
@@ -2185,18 +2585,16 @@ class MainWindow(PlayerMixin, SearchMixin, DownloadMixin, UpdateMixin, HistoryMi
             built = list(res.get("built") or [])
             imported = 0
             skipped_local = 0
+            existing_map: dict[tuple[str, str, str], HistoryEntry] = {
+                (e.provider, e.identifier, e.lang): e
+                for e in self.history._data
+            }
             for incoming in built:
-                existing: HistoryEntry | None = None
-                for e in self.history._data:
-                    if (
-                        e.provider == incoming.provider
-                        and e.identifier == incoming.identifier
-                        and e.lang == incoming.lang
-                    ):
-                        existing = e
-                        break
+                key = (incoming.provider, incoming.identifier, incoming.lang)
+                existing = existing_map.get(key)
                 if existing is None:
                     self.history.upsert(incoming)
+                    existing_map[key] = incoming
                     imported += 1
                     continue
 
@@ -2227,6 +2625,7 @@ class MainWindow(PlayerMixin, SearchMixin, DownloadMixin, UpdateMixin, HistoryMi
                     if k not in merged.episode_progress:
                         merged.episode_progress[k] = v
                 self.history.upsert(merged)
+                existing_map[key] = merged
                 imported += 1
 
             self.refresh_history_ui()
@@ -3097,7 +3496,7 @@ class MainWindow(PlayerMixin, SearchMixin, DownloadMixin, UpdateMixin, HistoryMi
     def _update_skeletons(self):
         self._skeleton_phase += 8
         any_loading = False
-        for lw in (self.results, self.recent, self.recommended):
+        for lw in (self.results, self.recent, self.recommended, self.featured):
             for i in range(lw.count()):
                 item = lw.item(i)
                 if item.data(Qt.ItemDataRole.UserRole) != "loading":
@@ -3226,6 +3625,8 @@ class MainWindow(PlayerMixin, SearchMixin, DownloadMixin, UpdateMixin, HistoryMi
         self.combo_dl_parallel.setCurrentIndex(self._max_parallel_downloads - 1)
         self._apply_provider_ui_state()
         self._apply_app_language_ui()
+        self._update_featured_tab_visibility()
+        self._featured_loaded = False
 
     def _sync_settings_ui_from_state(self):
         if not hasattr(self, "input_settings_download_dir"):
@@ -3356,6 +3757,8 @@ class MainWindow(PlayerMixin, SearchMixin, DownloadMixin, UpdateMixin, HistoryMi
         self.combo_dl_parallel.setCurrentIndex(self._max_parallel_downloads - 1)
         self._apply_provider_ui_state()
         self._apply_app_language_ui()
+        self._update_featured_tab_visibility()
+        self._featured_loaded = False
         self.refresh_history_ui()
         self.refresh_offline_library()
         self.set_status(self._tr("Impostazioni salvate.", "Settings saved."))

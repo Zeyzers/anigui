@@ -202,6 +202,11 @@ class SearchMixin:
                 font-size: 16px;
                 font-weight: 600;
             }
+            QLabel#featuredHeader {
+                color: #f4b55f;
+                font-size: 16px;
+                font-weight: 600;
+            }
             QLabel#incognitoBadge {
                 background: #c62026;
                 color: #ffffff;
@@ -425,6 +430,31 @@ class SearchMixin:
             self._remember_offline_cover_url(it.name, it.cover_url)
         self.recent.item(row).setIcon(QIcon(scaled))
         self.recent.item(row).setData(Qt.ItemDataRole.UserRole, "loaded")
+
+    def _on_featured_cover_loaded(self, row: int, nonce: int, data: bytes | None, from_cache: bool):
+        if nonce != self._featured_nonce:
+            return
+        if data is None:
+            if 0 <= row < self.featured.count():
+                self.featured.item(row).setData(Qt.ItemDataRole.UserRole, "loaded")
+            return
+        if row < 0 or row >= self.featured.count():
+            return
+        pix = QPixmap()
+        if not pix.loadFromData(data):
+            return
+        if from_cache:
+            pix = self._apply_cached_badge(pix)
+        scaled = pix.scaled(
+            self.featured.iconSize(),
+            Qt.AspectRatioMode.KeepAspectRatioByExpanding,
+            Qt.TransformationMode.SmoothTransformation,
+        )
+        if 0 <= row < len(self._featured_items):
+            it = self._featured_items[row]
+            self._remember_offline_cover_url(it.name, it.cover_url)
+        self.featured.item(row).setIcon(QIcon(scaled))
+        self.featured.item(row).setData(Qt.ItemDataRole.UserRole, "loaded")
 
     # ---------------- anipy operations ----------------
     def do_search(self, query: str) -> list[SearchItem]:
@@ -840,12 +870,11 @@ class SearchMixin:
 
     def on_refresh_recommended(self):
         self._recommended_loaded = True
-        self._begin_request()
         self._recent_nonce += 1
         self._recommended_nonce += 1
         recent_nonce = self._recent_nonce
         nonce = self._recommended_nonce
-        self.set_status("Carico recent + recommended…")
+        self.set_status(self._tr("Carico recenti + consigliati…", "Loading recent + recommended..."))
         self.recent.clear()
         self._recent_items = []
         self._recent_cards = []
@@ -892,14 +921,110 @@ class SearchMixin:
         w_recent.err.connect(self.on_worker_error)
         w.ok.connect(on_ok)
         w.err.connect(self.on_worker_error)
+        self._begin_request()
         self._track_worker(w_recent)
+        self._begin_request()
         self._track_worker(w)
         w_recent.start()
+        w.start()
+
+    def on_refresh_featured(self, force: bool = False):
+        self._featured_loaded = True
+        self._featured_nonce += 1
+        nonce = self._featured_nonce
+        self.featured.clear()
+        self._featured_items = []
+        self._featured_cards = []
+        if not self._is_featured_tab_enabled():
+            self.featured.addItem(self._tr("(attiva AniList per vedere questa tab)", "(enable AniList to use this tab)"))
+            self.featured.item(0).setFlags(Qt.ItemFlag.NoItemFlags)
+            return
+        token = self._anilist_active_token_from_ui()
+        provider_name = str(self.provider_name or "allanime")
+        lang_name = "DUB" if self.lang == LanguageTypeEnum.DUB else "SUB"
+        refresh_salt = int(time.time() * 1000) if force else 0
+        token_hash = hashlib.sha1(token.encode("utf-8", errors="ignore")).hexdigest()[:12]
+        cache_key = f"{provider_name}|{lang_name}|{token_hash}"
+        cache_ttl = 15 * 60
+        if not force:
+            cached = self._featured_cache.get(cache_key)
+            if isinstance(cached, dict):
+                ts = float(cached.get("ts", 0.0) or 0.0)
+                if (time.time() - ts) <= cache_ttl:
+                    cached_items = list(cached.get("items") or [])
+                    if cached_items:
+                        self._featured_items = cached_items
+                        self._load_items_with_covers(
+                            self._featured_items,
+                            self.featured,
+                            nonce,
+                            self._on_featured_cover_loaded,
+                        )
+                        for i in range(self.featured.count()):
+                            it = self.featured.item(i)
+                            if it is not None:
+                                it.setToolTip(self._featured_algorithm_tooltip())
+                        self.set_status(f"Featured: {len(self._featured_items)}")
+                        return
+        self.set_status(self._tr("Calcolo featured in corso…", "Computing featured picks..."))
+        self._begin_request()
+        w = Worker(
+            self._anilist_featured_recommendations_worker,
+            token,
+            provider_name,
+            lang_name,
+            refresh_salt,
+        )
+
+        def on_ok(items: list[SearchItem]):
+            if nonce != self._featured_nonce:
+                self._end_request()
+                return
+            self._featured_items = list(items or [])
+            if not self._featured_items:
+                self.featured.addItem(self._tr("(nessun featured trovato)", "(no featured picks found)"))
+                self.featured.item(0).setFlags(Qt.ItemFlag.NoItemFlags)
+                self.set_status("Featured: 0")
+                self._end_request()
+                return
+            self._load_items_with_covers(
+                self._featured_items,
+                self.featured,
+                nonce,
+                self._on_featured_cover_loaded,
+            )
+            self._featured_cache[cache_key] = {
+                "ts": time.time(),
+                "items": list(self._featured_items),
+            }
+            for i in range(self.featured.count()):
+                it = self.featured.item(i)
+                if it is not None:
+                    it.setToolTip(self._featured_algorithm_tooltip())
+            self.set_status(f"Featured: {len(self._featured_items)}")
+            self._end_request()
+
+        def on_err(msg: str):
+            if nonce != self._featured_nonce:
+                self._end_request()
+                return
+            self.featured.clear()
+            self._featured_items = []
+            self.featured.addItem(self._tr("(featured non disponibile)", "(featured unavailable)"))
+            self.featured.item(0).setFlags(Qt.ItemFlag.NoItemFlags)
+            self.set_status(self._tr(f"Featured non disponibile: {msg}", f"Featured unavailable: {msg}"))
+            self._end_request()
+
+        w.ok.connect(on_ok)
+        w.err.connect(on_err)
+        self._track_worker(w)
         w.start()
 
     def on_tab_changed(self, idx: int):
         if self.tabs.widget(idx) is self.tab_recommended and not self._recommended_loaded:
             self.on_refresh_recommended()
+        if self.tabs.widget(idx) is self.tab_featured and not self._featured_loaded:
+            self.on_refresh_featured()
         if self.tabs.widget(idx) is self.tab_offline:
             self.refresh_offline_library()
         if self.tabs.widget(idx) is self.tab_favorites:
@@ -1102,6 +1227,23 @@ class SearchMixin:
         self.set_status(f"Selezionato: {item.name} — carico episodi…")
         self.fetch_episodes()
 
+    def on_pick_featured(self):
+        row = self.featured.currentRow()
+        if row < 0 or row >= len(self._featured_items):
+            return
+        item = self._featured_items[row]
+        self._set_provider(item.source)
+        self.selected_search_item = item
+        self.selected_anime = self.build_anime_from_item(item)
+        self.lbl_anime_title.setText(item.name)
+        self.lbl_player_title.setText(item.name)
+        self.tabs.setCurrentWidget(self.tab_search)
+        self.search_stack.setCurrentWidget(self.page_anime)
+        self._current_search_view = "anime"
+        self._refresh_search_layout()
+        self.set_status(f"Selezionato: {item.name} — carico episodi…")
+        self.fetch_episodes()
+
     def on_pick_recent(self):
         row = self.recent.currentRow()
         if row < 0 or row >= len(self._recent_items):
@@ -1118,6 +1260,131 @@ class SearchMixin:
         self._refresh_search_layout()
         self.set_status(f"Selezionato: {item.name} — carico episodi…")
         self.fetch_episodes()
+
+    def on_mark_anime_planned(self):
+        if self._incognito_enabled:
+            self.set_status("Incognito attivo: salvataggio cronologia bloccato.")
+            return
+        if not self.selected_anime:
+            self.notify_err(self._tr("Apri prima un anime.", "Open an anime first."))
+            return
+        ident = str(
+            getattr(self.selected_anime, "identifier", None)
+            or getattr(self.selected_anime, "_identifier", None)
+            or getattr(self.selected_anime, "ref", "")
+        ).strip()
+        if not ident:
+            self.notify_err(self._tr("Impossibile identificare questo anime.", "Unable to identify this anime."))
+            return
+        lang_s = "SUB" if self.lang == LanguageTypeEnum.SUB else "DUB"
+        now = time.time()
+        existing = self._current_history_entry()
+        name = str(getattr(self.selected_anime, "name", "") or getattr(self.selected_search_item, "name", "anime")).strip()
+        cover_url = (
+            getattr(self.selected_search_item, "cover_url", None)
+            if self.selected_search_item
+            else (existing.cover_url if existing is not None else None)
+        )
+        entry = HistoryEntry(
+            provider=self.provider_name,
+            identifier=ident,
+            name=name or "anime",
+            lang=lang_s,
+            last_ep=0.0,
+            updated_at=now,
+            cover_url=cover_url,
+            last_pos=0.0,
+            last_duration=0.0,
+            last_percent=0.0,
+            completed=False,
+            watched_eps=[],
+            episode_progress={},
+        )
+        self.history.upsert(entry)
+        self._anilist_sync_progress_async(entry, force=True)
+        self.refresh_history_ui()
+        if self.selected_anime is not None:
+            self.fetch_episodes()
+        self.set_status(self._tr(f"Aggiunto a Da iniziare: {entry.name}", f"Added to Planned: {entry.name}"))
+
+    def on_mark_anime_completed(self):
+        if self._incognito_enabled:
+            self.set_status("Incognito attivo: salvataggio cronologia bloccato.")
+            return
+        if not self.selected_anime:
+            self.notify_err(self._tr("Apri prima un anime.", "Open an anime first."))
+            return
+        ident = str(
+            getattr(self.selected_anime, "identifier", None)
+            or getattr(self.selected_anime, "_identifier", None)
+            or getattr(self.selected_anime, "ref", "")
+        ).strip()
+        if not ident:
+            self.notify_err(self._tr("Impossibile identificare questo anime.", "Unable to identify this anime."))
+            return
+        lang_s = "SUB" if self.lang == LanguageTypeEnum.SUB else "DUB"
+        now = time.time()
+        existing = self._current_history_entry()
+        name = str(getattr(self.selected_anime, "name", "") or getattr(self.selected_search_item, "name", "anime")).strip()
+        cover_url = (
+            getattr(self.selected_search_item, "cover_url", None)
+            if self.selected_search_item
+            else (existing.cover_url if existing is not None else None)
+        )
+
+        eps_values: list[float] = []
+        for ep in (self.episodes_list or []):
+            f = self._to_ep_float(ep)
+            if f is not None and f > 0:
+                eps_values.append(float(f))
+        eps_values = sorted(set(eps_values))
+        if not eps_values and existing is not None:
+            eps_values = sorted(self._entry_watched_eps_set(existing))
+        if not eps_values and self.current_ep is not None:
+            cur = self._to_ep_float(self.current_ep)
+            if cur is not None and cur > 0:
+                eps_values = [float(cur)]
+        if not eps_values:
+            self.notify_err(
+                self._tr(
+                    "Attendi il caricamento episodi prima di segnare completato.",
+                    "Wait for episode list to load before marking completed.",
+                )
+            )
+            return
+
+        ep_progress: dict[str, dict[str, Any]] = {}
+        for epf in eps_values:
+            ep_key = str(int(epf)) if float(epf).is_integer() else str(epf)
+            ep_progress[ep_key] = {
+                "pos": 0.0,
+                "dur": 0.0,
+                "percent": 100.0,
+                "completed": True,
+                "updated_at": now,
+            }
+        last_ep = max(eps_values)
+        entry = HistoryEntry(
+            provider=self.provider_name,
+            identifier=ident,
+            name=name or "anime",
+            lang=lang_s,
+            last_ep=last_ep,
+            updated_at=now,
+            cover_url=cover_url,
+            last_pos=0.0,
+            last_duration=0.0,
+            last_percent=100.0,
+            completed=True,
+            watched_eps=list(eps_values),
+            episode_progress=ep_progress,
+        )
+        self.history.upsert(entry)
+        self._anilist_sync_progress_async(entry, force=True)
+        self.refresh_history_ui()
+        if self.selected_anime is not None:
+            self.fetch_episodes()
+        self.set_status(self._tr(f"Segnato come completato: {entry.name}", f"Marked as completed: {entry.name}"))
 
     def fetch_episodes(
         self,

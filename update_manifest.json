@@ -1,13 +1,13 @@
 {
-    "version":  "1.0.5",
+    "version":  "1.1.0",
     "windows":  {
-                    "url":  "https://github.com/Zeyzers/anigui/releases/download/v1.0.5/AniguiApp.exe",
-                    "sha256":  "fd59ed361caf733e2262fb956ef25c424cedfb6ebd6bd84d3b93daf8a2c2a0af"
+                    "url":  "https://github.com/Zeyzers/anigui/releases/download/v1.1.0/AniguiApp.exe",
+                    "sha256":  "5ae15e3c7915dc9cb2a5fe6e1b75cfaafa200e68406b7900afa824f3cbacb7ce"
                 },
     "linux":  {
                   "url":  "https://raw.githubusercontent.com/Zeyzers/anigui/main/app.py",
                   "sha256":  "9e056670378d3a1897cb179559e958b8ec271c1f16ded95ec8d71cabd1c88be8"
               },
     "page_url":  "https://github.com/Zeyzers/anigui/releases/latest",
-    "notes":  "Bugfix worker cleanup"
+    "notes":  "Bugfix Fullscreen and Added Featured tab"
 }

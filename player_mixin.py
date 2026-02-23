@@ -15,7 +15,12 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from components import StreamResult, Worker
+from components import (
+    FullscreenPlayerWindow,
+    MiniPlayerWindow,
+    StreamResult,
+    Worker,
+)
 
 
 def debug_log(msg: str) -> None:
