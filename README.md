@@ -44,6 +44,14 @@ source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
+### Linux quick setup script (recommended)
+
+```bash
+chmod +x setup.sh doctor.sh
+./setup.sh
+./doctor.sh
+```
+
 ## Run
 
 ### Windows
@@ -102,6 +110,9 @@ AniList integration is optional. If enabled:
 - If playback fails, verify `mpv` availability on your system
 - If a provider returns empty/failed results, retry later or switch provider
 - If AniList sync fails, verify token validity and network connectivity
+- On Linux, if Qt fails with `Could not load the Qt platform plugin "xcb"`,
+  install: `sudo apt update && sudo apt install -y libxcb-cursor0`
+- On Linux, run `./doctor.sh` to check runtime dependencies quickly
 
 ## Project scope
 
