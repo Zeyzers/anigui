@@ -55,6 +55,11 @@ class HistoryMixin:
             )
         )
         self._history_items = [row[0] for row in ordered_rows]
+        total_rows = len(ordered_rows)
+        # Avoid spawning hundreds of cover workers at once on very large lists.
+        cover_jobs_started = 0
+        max_cover_jobs = 40 if total_rows >= 260 else 120
+        resolve_missing_covers = total_rows < 220
         prev_marker: str | None = None
         grid_slot = 0
         for e, marker, in_progress, seen_count, last_prog in ordered_rows:
@@ -214,13 +219,15 @@ class HistoryMixin:
             self.hist_list.setItemWidget(item, card)
             self._history_cover_labels[list_row] = cover
 
-            if e.cover_url:
+            if e.cover_url and cover_jobs_started < max_cover_jobs:
+                cover_jobs_started += 1
                 w_cover = Worker(self.do_fetch_cover, e.cover_url)
                 w_cover.ok.connect(lambda data, r=list_row: self._on_history_cover_loaded(r, data[0], data[1]))
                 w_cover.err.connect(lambda _msg: None)
                 self._track_worker(w_cover)
                 w_cover.start()
-            else:
+            elif (not e.cover_url) and resolve_missing_covers and cover_jobs_started < max_cover_jobs:
+                cover_jobs_started += 1
                 w_cover = Worker(self.do_fetch_cover_for_history_entry, e)
                 w_cover.ok.connect(
                     lambda data, r=list_row, h=e: self._on_history_cover_resolved(
@@ -467,6 +474,15 @@ class HistoryMixin:
         if not getattr(self, "_selected_history", None):
             return
         e: HistoryEntry = self._selected_history
+        ident = str(getattr(e, "identifier", "") or "")
+        if ident.startswith("planned:") or ident.startswith("anilist-only:"):
+            self.set_status(
+                self._tr(
+                    "Titolo AniList non ancora associato al provider: aprilo dalla ricerca manualmente.",
+                    "AniList title not matched to provider yet: open it from search manually.",
+                )
+            )
+            return
 
         self._set_provider(e.provider if e.provider else "allanime")
         self.lang = LanguageTypeEnum.SUB if e.lang == "SUB" else LanguageTypeEnum.DUB
@@ -566,9 +582,8 @@ class HistoryMixin:
         )
         e.last_percent = 100.0
         e.updated_at = time.time()
-        avail_eps = self._episodes_list_for_history_entry(e)
-        if avail_eps is not None:
-            e.completed = self._entry_is_series_completed(e, avail_eps)
+        if not bool(getattr(e, "completed", False)):
+            e.watch_status = "Watching"
         self.history.upsert(e)
         self.refresh_history_ui()
         self.on_history_resume()
@@ -595,9 +610,8 @@ class HistoryMixin:
         )
         e.last_percent = 100.0
         e.updated_at = time.time()
-        avail_eps = self._episodes_list_for_history_entry(e)
-        if avail_eps is not None:
-            e.completed = self._entry_is_series_completed(e, avail_eps)
+        if not bool(getattr(e, "completed", False)):
+            e.watch_status = "Watching"
         self.history.upsert(e)
         self.refresh_history_ui()
         self.set_status(f"Segnato come visto: {e.name} ep {e.last_ep}")
@@ -609,6 +623,15 @@ class HistoryMixin:
                 return
             self._selected_history = cur
         e: HistoryEntry = self._selected_history
+        ident = str(getattr(e, "identifier", "") or "")
+        if ident.startswith("planned:") or ident.startswith("anilist-only:"):
+            self.set_status(
+                self._tr(
+                    "Dettagli non disponibili per titolo non associato al provider. Usa la ricerca.",
+                    "Details unavailable for unmatched title. Use search.",
+                )
+            )
+            return
 
         self._set_provider(e.provider if e.provider else "allanime")
         self.lang = LanguageTypeEnum.SUB if e.lang == "SUB" else LanguageTypeEnum.DUB
