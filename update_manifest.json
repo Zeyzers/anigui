@@ -1,13 +1,13 @@
 {
-    "version":  "1.1.6",
+    "version":  "1.1.7",
     "windows":  {
-                    "url":  "https://github.com/Zeyzers/anigui/releases/download/v1.1.6/AniguiApp.exe",
-                    "sha256":  "9d44d84c3b76584f79a13c686e539c4d35640b6bd8aac20d16ba7e03af15bba0"
+                    "url":  "https://github.com/Zeyzers/anigui/releases/download/v1.1.7/AniguiApp.exe",
+                    "sha256":  "a1e13be24fb9d83a14a625910ee6be02e54ba642fb8f8b3472a1ff710ec00486"
                 },
     "linux":  {
                   "url":  "https://raw.githubusercontent.com/Zeyzers/anigui/main/app.py",
                   "sha256":  "aa8f2ca032d8201477e8cc7b649c8106d156e273f0ead4c6009de59ff518c428"
               },
     "page_url":  "https://github.com/Zeyzers/anigui/releases/latest",
-    "notes":  "- New Watchlist states: Paused and Dropped (fully integrated with AniList pull/sync).\n- Improved Watching classification: entries with real progress no longer fall into Planned.\n- Large-list performance fix: reduced UI freezes/unresponsive behavior on very large watchlists.\n- Automatic watchlist deduplication (prefers better entries and covered entries when appropriate).\n- More robust AniList import: improved title matching (romaji/english/synonyms + season handling), fewer missing anime.\n- Better AniList placeholder handling: unmatched entries no longer disappear.\n- General stability fixes and cleanup."
+    "notes":  "Solved no cover on huge lists"
 }

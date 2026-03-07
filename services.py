@@ -10,7 +10,7 @@ import urllib.request
 from typing import Any
 
 
-APP_VERSION = "1.1.6"
+APP_VERSION = "1.1.7"
 UPDATE_MANIFEST_URL = os.getenv(
     "ANIGUI_UPDATE_MANIFEST_URL",
     "https://raw.githubusercontent.com/Zeyzers/anigui/main/update_manifest.json",

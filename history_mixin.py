@@ -31,6 +31,9 @@ class HistoryMixin:
         self._clear_history_section_overlays()
         self.hist_list.clear()
         self._history_cover_labels = {}
+        self._history_cover_nonce = int(getattr(self, "_history_cover_nonce", 0)) + 1
+        self._history_cover_inflight_rows: set[int] = set()
+        self._history_cover_max_inflight = 6
         all_items = self.history.list()
         self._history_items = []
         active_filter = str(getattr(self, "_history_filter", "All") or "All")
@@ -55,11 +58,6 @@ class HistoryMixin:
             )
         )
         self._history_items = [row[0] for row in ordered_rows]
-        total_rows = len(ordered_rows)
-        # Avoid spawning hundreds of cover workers at once on very large lists.
-        cover_jobs_started = 0
-        max_cover_jobs = 40 if total_rows >= 260 else 120
-        resolve_missing_covers = total_rows < 220
         prev_marker: str | None = None
         grid_slot = 0
         for e, marker, in_progress, seen_count, last_prog in ordered_rows:
@@ -155,7 +153,7 @@ class HistoryMixin:
             item = QListWidgetItem("")
             item.setSizeHint(QSize(420, 98))
             item.setData(Qt.ItemDataRole.UserRole, e)
-            item.setData(Qt.ItemDataRole.UserRole + 1, "loading")
+            item.setData(Qt.ItemDataRole.UserRole + 1, "pending")
             tip = f"{e.name}\n{marker_label} · EP {e.last_ep} · {e.lang}\n{rel_time}"
             if detail_line:
                 tip += f"\n{detail_line}"
@@ -218,32 +216,10 @@ class HistoryMixin:
             lay.addLayout(right_col, 0)
             self.hist_list.setItemWidget(item, card)
             self._history_cover_labels[list_row] = cover
-
-            if e.cover_url and cover_jobs_started < max_cover_jobs:
-                cover_jobs_started += 1
-                w_cover = Worker(self.do_fetch_cover, e.cover_url)
-                w_cover.ok.connect(lambda data, r=list_row: self._on_history_cover_loaded(r, data[0], data[1]))
-                w_cover.err.connect(lambda _msg: None)
-                self._track_worker(w_cover)
-                w_cover.start()
-            elif (not e.cover_url) and resolve_missing_covers and cover_jobs_started < max_cover_jobs:
-                cover_jobs_started += 1
-                w_cover = Worker(self.do_fetch_cover_for_history_entry, e)
-                w_cover.ok.connect(
-                    lambda data, r=list_row, h=e: self._on_history_cover_resolved(
-                        r,
-                        h,
-                        data[0],
-                        data[1],
-                        data[2],
-                    )
-                )
-                w_cover.err.connect(lambda _msg: None)
-                self._track_worker(w_cover)
-                w_cover.start()
         self._relayout_history_cards()
         QTimer.singleShot(0, self._relayout_history_cards)
         QTimer.singleShot(80, self._relayout_history_cards)
+        QTimer.singleShot(0, self._schedule_visible_history_cover_jobs)
         if not self._history_items:
             self.hist_list.addItem(self._tr("(vuoto)", "(empty)"))
 
@@ -324,6 +300,143 @@ class HistoryMixin:
             except Exception:
                 pass
             self._history_section_overlays.pop(k, None)
+        self._schedule_visible_history_cover_jobs()
+
+    def _history_visible_candidate_rows(self) -> list[int]:
+        rows: list[int] = []
+        vp = self.hist_list.viewport()
+        vrect = vp.rect().adjusted(0, -220, 0, 220)
+        for i in range(self.hist_list.count()):
+            it = self.hist_list.item(i)
+            if it is None:
+                continue
+            if not isinstance(it.data(Qt.ItemDataRole.UserRole), HistoryEntry):
+                continue
+            if str(it.data(Qt.ItemDataRole.UserRole + 1) or "") != "pending":
+                continue
+            r = self.hist_list.visualItemRect(it)
+            if r.isValid() and r.intersects(vrect):
+                rows.append(i)
+        return rows
+
+    def _try_set_history_cover_from_cache(self, row: int, entry: HistoryEntry) -> bool:
+        url = str(getattr(entry, "cover_url", "") or "").strip()
+        if not url:
+            return False
+        cache_path = self._cover_cache_path(url)
+        if not cache_path or not os.path.exists(cache_path):
+            return False
+        try:
+            with open(cache_path, "rb") as f:
+                data = f.read()
+            if not data:
+                return False
+            self._on_history_cover_loaded(row, data, True)
+            return True
+        except Exception:
+            return False
+
+    def _start_history_cover_job(self, row: int, nonce: int):
+        if nonce != int(getattr(self, "_history_cover_nonce", 0)):
+            return
+        if row < 0 or row >= self.hist_list.count():
+            return
+        it = self.hist_list.item(row)
+        if it is None:
+            return
+        if str(it.data(Qt.ItemDataRole.UserRole + 1) or "") != "pending":
+            return
+        entry = it.data(Qt.ItemDataRole.UserRole)
+        if not isinstance(entry, HistoryEntry):
+            return
+        if self._try_set_history_cover_from_cache(row, entry):
+            return
+        it.setData(Qt.ItemDataRole.UserRole + 1, "loading")
+        self._history_cover_inflight_rows.add(row)
+        if entry.cover_url:
+            w_cover = Worker(self.do_fetch_cover, entry.cover_url)
+
+            def on_ok(data: object, r=row, n=nonce):
+                self._history_cover_inflight_rows.discard(r)
+                if n != int(getattr(self, "_history_cover_nonce", 0)):
+                    return
+                try:
+                    self._on_history_cover_loaded(r, data[0], data[1])
+                finally:
+                    QTimer.singleShot(0, self._schedule_visible_history_cover_jobs)
+
+            def on_err(_msg: str, r=row, n=nonce):
+                self._history_cover_inflight_rows.discard(r)
+                if n != int(getattr(self, "_history_cover_nonce", 0)):
+                    return
+                if 0 <= r < self.hist_list.count():
+                    self.hist_list.item(r).setData(Qt.ItemDataRole.UserRole + 1, "error")
+                QTimer.singleShot(0, self._schedule_visible_history_cover_jobs)
+
+            w_cover.ok.connect(on_ok)
+            w_cover.err.connect(on_err)
+            self._track_worker(w_cover)
+            w_cover.start()
+            return
+
+        w_cover = Worker(self.do_fetch_cover_for_history_entry, entry)
+
+        def on_ok_resolve(data: object, r=row, h=entry, n=nonce):
+            self._history_cover_inflight_rows.discard(r)
+            if n != int(getattr(self, "_history_cover_nonce", 0)):
+                return
+            try:
+                self._on_history_cover_resolved(r, h, data[0], data[1], data[2])
+            finally:
+                QTimer.singleShot(0, self._schedule_visible_history_cover_jobs)
+
+        def on_err_resolve(_msg: str, r=row, n=nonce):
+            self._history_cover_inflight_rows.discard(r)
+            if n != int(getattr(self, "_history_cover_nonce", 0)):
+                return
+            if 0 <= r < self.hist_list.count():
+                self.hist_list.item(r).setData(Qt.ItemDataRole.UserRole + 1, "error")
+            QTimer.singleShot(0, self._schedule_visible_history_cover_jobs)
+
+        w_cover.ok.connect(on_ok_resolve)
+        w_cover.err.connect(on_err_resolve)
+        self._track_worker(w_cover)
+        w_cover.start()
+
+    def _schedule_visible_history_cover_jobs(self):
+        if not hasattr(self, "hist_list"):
+            return
+        nonce = int(getattr(self, "_history_cover_nonce", 0))
+        if nonce <= 0:
+            return
+        max_inflight = int(getattr(self, "_history_cover_max_inflight", 6))
+        while len(self._history_cover_inflight_rows) < max_inflight:
+            visible = self._history_visible_candidate_rows()
+            if visible:
+                next_row = visible[0]
+                self._start_history_cover_job(next_row, nonce)
+                if next_row in self._history_cover_inflight_rows:
+                    continue
+                # cache-hit path does not increase inflight; continue.
+                continue
+
+            # fallback: keep making progress for offscreen pending rows.
+            next_row = -1
+            for i in range(self.hist_list.count()):
+                it = self.hist_list.item(i)
+                if it is None:
+                    continue
+                if not isinstance(it.data(Qt.ItemDataRole.UserRole), HistoryEntry):
+                    continue
+                if str(it.data(Qt.ItemDataRole.UserRole + 1) or "") == "pending":
+                    next_row = i
+                    break
+            if next_row < 0:
+                break
+            self._start_history_cover_job(next_row, nonce)
+            if next_row in self._history_cover_inflight_rows:
+                continue
+            continue
 
     def _history_entry_status(
         self,
@@ -425,7 +538,11 @@ class HistoryMixin:
         self._position_history_section_overlays()
 
     def _on_history_cover_loaded(self, row: int, data: bytes | None, from_cache: bool):
+        if row in getattr(self, "_history_cover_inflight_rows", set()):
+            self._history_cover_inflight_rows.discard(row)
         if data is None:
+            if 0 <= row < self.hist_list.count():
+                self.hist_list.item(row).setData(Qt.ItemDataRole.UserRole + 1, "error")
             return
         if row < 0 or row >= self.hist_list.count():
             return
@@ -444,6 +561,7 @@ class HistoryMixin:
         )
         label.setPixmap(scaled)
         self.hist_list.item(row).setData(Qt.ItemDataRole.UserRole + 1, "loaded")
+        QTimer.singleShot(0, self._schedule_visible_history_cover_jobs)
 
     def _history_entry_from_current_item(self) -> HistoryEntry | None:
         item = self.hist_list.currentItem()
