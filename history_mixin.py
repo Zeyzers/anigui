@@ -35,7 +35,13 @@ class HistoryMixin:
         self._history_items = []
         active_filter = str(getattr(self, "_history_filter", "All") or "All")
         ordered_rows: list[tuple[HistoryEntry, str, bool, int, dict[str, Any] | None]] = []
-        marker_rank = {"Watching": 0, "Planned": 1, "Completed": 2}
+        marker_rank = {
+            "Watching": 0,
+            "Paused": 1,
+            "Planned": 2,
+            "Dropped": 3,
+            "Completed": 4,
+        }
         for e in all_items:
             marker, in_progress, seen_count, last_prog = self._history_entry_status(e)
             if active_filter != "All" and marker != active_filter:
@@ -63,7 +69,9 @@ class HistoryMixin:
                     grid_slot += 1
                 section_text = {
                     "Watching": self._tr("In corso", "Watching"),
+                    "Paused": self._tr("In pausa", "Paused"),
                     "Planned": self._tr("Da iniziare", "Planned"),
+                    "Dropped": self._tr("Interrotti", "Dropped"),
                     "Completed": self._tr("Completati", "Completed"),
                 }.get(marker, marker)
                 hitem = QListWidgetItem("")
@@ -86,16 +94,24 @@ class HistoryMixin:
             marker_label = {
                 "Completed": self._tr("Completato", "Completed"),
                 "Watching": self._tr("In corso", "Watching"),
+                "Paused": self._tr("In pausa", "Paused"),
                 "Planned": self._tr("Da iniziare", "Planned"),
+                "Dropped": self._tr("Interrotto", "Dropped"),
             }.get(marker, marker)
             if marker == "Completed":
                 title_line = f"{self._tr('Completato', 'Completed')} {e.name}"
+                progress_line = f"EP {e.last_ep} · {e.lang}"
+            elif marker == "Paused":
+                title_line = f"{self._tr('In pausa', 'Paused')} {e.name}"
                 progress_line = f"EP {e.last_ep} · {e.lang}"
             elif in_progress:
                 title_line = self._tr(f"In visione episodio {e.last_ep} di", f"Watching episode {e.last_ep} of")
                 progress_line = e.name
             elif marker == "Planned":
                 title_line = f"{self._tr('Da iniziare', 'Planned')} {e.name}"
+                progress_line = f"EP {e.last_ep} · {e.lang}"
+            elif marker == "Dropped":
+                title_line = f"{self._tr('Interrotto', 'Dropped')} {e.name}"
                 progress_line = f"EP {e.last_ep} · {e.lang}"
             else:
                 title_line = self._tr(f"Visto episodio {e.last_ep} di", f"Watched episode {e.last_ep} of")
@@ -124,8 +140,12 @@ class HistoryMixin:
                     detail_line = self._tr(f"Riprendi {self.fmt_time(pos_v)}", f"Resume {self.fmt_time(pos_v)}")
             elif marker == "Watching" and seen_count > 0:
                 detail_line = self._tr(f"Episodi visti: {seen_count}", f"Seen episodes: {seen_count}")
+            elif marker == "Paused":
+                detail_line = self._tr("In pausa", "Paused")
             elif marker == "Planned":
                 detail_line = self._tr("Non iniziato", "Not started")
+            elif marker == "Dropped":
+                detail_line = self._tr("Interrotto", "Dropped")
 
             item = QListWidgetItem("")
             item.setSizeHint(QSize(420, 98))
@@ -314,10 +334,30 @@ class HistoryMixin:
             lp_done = bool(last_prog.get("completed", False))
             in_progress = (not lp_done) and (lp_pos > 0.0 or lp_pct > 0.0)
         seen_count = len(self._entry_watched_eps_set(entry))
+        status_raw = str(getattr(entry, "watch_status", "") or "").strip().casefold()
+        status_map = {
+            "current": "Watching",
+            "watching": "Watching",
+            "repeating": "Watching",
+            "planning": "Planned",
+            "planned": "Planned",
+            "paused": "Paused",
+            "dropped": "Dropped",
+            "completed": "Completed",
+        }
+        explicit = status_map.get(status_raw, "")
         if bool(entry.completed) and not in_progress:
             return "Completed", in_progress, seen_count, last_prog
+        if explicit == "Completed":
+            return "Completed", in_progress, seen_count, last_prog
+        if explicit in {"Paused", "Dropped"}:
+            return explicit, in_progress, seen_count, last_prog
         if in_progress or seen_count > 0:
             return "Watching", in_progress, seen_count, last_prog
+        if explicit == "Watching":
+            return "Watching", in_progress, seen_count, last_prog
+        if explicit == "Planned":
+            return "Planned", in_progress, seen_count, last_prog
         return "Planned", in_progress, seen_count, last_prog
 
     def on_history_filter_changed(self):

@@ -51,6 +51,7 @@ class HistoryEntry:
     last_duration: float = 0.0
     last_percent: float = 0.0
     completed: bool = False
+    watch_status: str = ""
     watched_eps: list[float] = field(default_factory=list)
     episode_progress: dict[str, dict[str, Any]] = field(default_factory=dict)
 
@@ -114,4 +115,3 @@ class HistoryStore:
             )
         ]
         self.save()
-

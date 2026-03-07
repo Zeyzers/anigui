@@ -108,7 +108,7 @@ def debug_log(msg: str) -> None:
 class MainWindow(PlayerMixin, SearchMixin, DownloadMixin, UpdateMixin, HistoryMixin, QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Anigui")
+        self.setWindowTitle("Anigui" + APP_VERSION)
         self.resize(1300, 780)
 
         self._init_settings_and_runtime()
@@ -850,7 +850,7 @@ class MainWindow(PlayerMixin, SearchMixin, DownloadMixin, UpdateMixin, HistoryMi
         hist_layout = QVBoxLayout(self.tab_history)
 
         hist_top = QHBoxLayout()
-        self.lbl_history_header = QLabel("Watchlist: Planned · Watching · Completed")
+        self.lbl_history_header = QLabel("Watchlist: Planned · Watching · Paused · Dropped · Completed")
         hist_top.addWidget(self.lbl_history_header, 1)
         self.lbl_history_filter = QLabel("Filter")
         hist_top.addWidget(self.lbl_history_filter, 0)
@@ -858,7 +858,9 @@ class MainWindow(PlayerMixin, SearchMixin, DownloadMixin, UpdateMixin, HistoryMi
         self.combo_history_filter.addItem("All", "All")
         self.combo_history_filter.addItem("Completed", "Completed")
         self.combo_history_filter.addItem("Watching", "Watching")
+        self.combo_history_filter.addItem("Paused", "Paused")
         self.combo_history_filter.addItem("Planned", "Planned")
+        self.combo_history_filter.addItem("Dropped", "Dropped")
         self.combo_history_filter.currentIndexChanged.connect(self.on_history_filter_changed)
         hist_top.addWidget(self.combo_history_filter, 0)
         hist_layout.addLayout(hist_top)
@@ -1159,7 +1161,9 @@ class MainWindow(PlayerMixin, SearchMixin, DownloadMixin, UpdateMixin, HistoryMi
             ("All", "Tutti"),
             ("Completed", "Completati"),
             ("Watching", "In corso"),
+            ("Paused", "In pausa"),
             ("Planned", "Da iniziare"),
+            ("Dropped", "Interrotti"),
             ("Open folder", "Apri cartella"),
             ("Open downloads", "Apri download"),
             ("Back to Search", "Torna alla ricerca"),
@@ -1516,8 +1520,8 @@ class MainWindow(PlayerMixin, SearchMixin, DownloadMixin, UpdateMixin, HistoryMi
         # History/watchlist
         self.lbl_history_header.setText(
             self._tr(
-                "Lista visione: Da iniziare · In corso · Completati",
-                "Watchlist: Planned · Watching · Completed",
+                "Lista visione: Da iniziare · In corso · In pausa · Interrotti · Completati",
+                "Watchlist: Planned · Watching · Paused · Dropped · Completed",
             )
         )
         self.lbl_history_filter.setText(self._tr("Filtro", "Filter"))
@@ -1527,7 +1531,9 @@ class MainWindow(PlayerMixin, SearchMixin, DownloadMixin, UpdateMixin, HistoryMi
                 (self._tr("Tutti", "All"), "All"),
                 (self._tr("Completati", "Completed"), "Completed"),
                 (self._tr("In corso", "Watching"), "Watching"),
+                (self._tr("In pausa", "Paused"), "Paused"),
                 (self._tr("Da iniziare", "Planned"), "Planned"),
+                (self._tr("Interrotti", "Dropped"), "Dropped"),
             ],
             keep_data=self._history_filter,
         )
@@ -1621,13 +1627,36 @@ class MainWindow(PlayerMixin, SearchMixin, DownloadMixin, UpdateMixin, HistoryMi
         return payload
 
     @staticmethod
+    def _watch_status_from_anilist(remote_status: str) -> str:
+        rs = str(remote_status or "").strip().upper()
+        if rs == "PLANNING":
+            return "Planned"
+        if rs == "PAUSED":
+            return "Paused"
+        if rs == "DROPPED":
+            return "Dropped"
+        if rs == "COMPLETED":
+            return "Completed"
+        return "Watching"
+
+    @staticmethod
     def _anilist_status_for_entry(entry: HistoryEntry) -> str:
+        watch_status = str(getattr(entry, "watch_status", "") or "").strip().casefold()
         prog = 0
         try:
             prog = int(max(0.0, float(entry.last_ep)))
         except Exception:
             prog = 0
-        if bool(entry.completed) or prog > 0 or bool(entry.watched_eps):
+        has_progress = prog > 0 or bool(entry.watched_eps)
+        if bool(entry.completed) or watch_status == "completed":
+            return "COMPLETED"
+        if watch_status == "paused":
+            return "PAUSED"
+        if watch_status == "dropped":
+            return "DROPPED"
+        if watch_status in {"planned", "planning"} and not has_progress:
+            return "PLANNING"
+        if has_progress:
             return "CURRENT"
         return "PLANNING"
 
@@ -1722,7 +1751,12 @@ class MainWindow(PlayerMixin, SearchMixin, DownloadMixin, UpdateMixin, HistoryMi
             {
                 "mediaId": int(media_id),
                 "status": status,
-                "progress": int(max(0 if str(status).upper() == "PLANNING" else 1, progress)),
+                "progress": int(
+                    max(
+                        0 if str(status).upper() in {"PLANNING", "PAUSED", "DROPPED"} else 1,
+                        progress,
+                    )
+                ),
             },
             token=token,
         )
@@ -1833,7 +1867,7 @@ class MainWindow(PlayerMixin, SearchMixin, DownloadMixin, UpdateMixin, HistoryMi
           MediaListCollection(
             userId: 0,
             type: ANIME,
-            status_in: [CURRENT, REPEATING, COMPLETED, PLANNING]
+            status_in: [CURRENT, REPEATING, COMPLETED, PAUSED, DROPPED, PLANNING]
           ) {
             lists {
               status
@@ -1860,7 +1894,7 @@ class MainWindow(PlayerMixin, SearchMixin, DownloadMixin, UpdateMixin, HistoryMi
           MediaListCollection(
             userId: $userId,
             type: ANIME,
-            status_in: [CURRENT, REPEATING, COMPLETED, PLANNING]
+            status_in: [CURRENT, REPEATING, COMPLETED, PAUSED, DROPPED, PLANNING]
           ) {
             lists {
               status
@@ -2223,6 +2257,7 @@ class MainWindow(PlayerMixin, SearchMixin, DownloadMixin, UpdateMixin, HistoryMi
             media_id = int(row.get("media_id") or 0)
             entry_id = int(row.get("entry_id") or 0)
             remote_status = str(row.get("status") or "").upper()
+            local_status = self._watch_status_from_anilist(remote_status)
             if media_id > 0:
                 for t in titles:
                     nt = self._norm_title(t)
@@ -2298,6 +2333,7 @@ class MainWindow(PlayerMixin, SearchMixin, DownloadMixin, UpdateMixin, HistoryMi
                             last_duration=0.0,
                             last_percent=0.0,
                             completed=False,
+                            watch_status=local_status,
                             watched_eps=[],
                             episode_progress={},
                         )
@@ -2334,6 +2370,7 @@ class MainWindow(PlayerMixin, SearchMixin, DownloadMixin, UpdateMixin, HistoryMi
                                 last_duration=0.0,
                                 last_percent=0.0,
                                 completed=False,
+                                watch_status=local_status,
                                 watched_eps=[],
                                 episode_progress={},
                             )
@@ -2372,6 +2409,7 @@ class MainWindow(PlayerMixin, SearchMixin, DownloadMixin, UpdateMixin, HistoryMi
                     last_duration=0.0,
                     last_percent=100.0 if progress > 0 else 0.0,
                     completed=(remote_status == "COMPLETED"),
+                    watch_status=local_status,
                     watched_eps=watched,
                     episode_progress=ep_prog,
                 )
@@ -2388,6 +2426,88 @@ class MainWindow(PlayerMixin, SearchMixin, DownloadMixin, UpdateMixin, HistoryMi
             "remote_planned": remote_planned,
             "imported_planned": imported_planned,
             "planned_missing_keys": planned_missing_keys,
+        }
+
+    @staticmethod
+    def _save_history_entries_to_path(path: str, entries: list[HistoryEntry]) -> None:
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(
+                [asdict(x) for x in entries],
+                f,
+                ensure_ascii=False,
+                indent=2,
+            )
+        os.replace(tmp, path)
+
+    def _anilist_pull_and_merge_worker(
+        self,
+        token: str,
+        provider_name: str,
+        lang_name: str,
+        local_history: list[HistoryEntry],
+    ) -> dict[str, Any]:
+        res = self._anilist_pull_worker(token, provider_name, lang_name)
+        built = list(res.get("built") or [])
+        skipped_local = 0
+        imported = 0
+
+        existing_map: dict[tuple[str, str, str], HistoryEntry] = {
+            (e.provider, e.identifier, e.lang): e
+            for e in local_history
+        }
+        for incoming in built:
+            key = (incoming.provider, incoming.identifier, incoming.lang)
+            existing = existing_map.get(key)
+            if existing is None:
+                existing_map[key] = incoming
+                imported += 1
+                continue
+
+            # Never downgrade local progress.
+            if float(existing.last_ep) > float(incoming.last_ep):
+                skipped_local += 1
+                continue
+
+            merged = HistoryEntry(
+                provider=existing.provider,
+                identifier=existing.identifier,
+                name=existing.name or incoming.name,
+                lang=existing.lang,
+                last_ep=max(float(existing.last_ep), float(incoming.last_ep)),
+                updated_at=time.time(),
+                cover_url=existing.cover_url or incoming.cover_url,
+                last_pos=existing.last_pos,
+                last_duration=existing.last_duration,
+                last_percent=max(float(existing.last_percent), float(incoming.last_percent)),
+                completed=bool(existing.completed or incoming.completed),
+                watch_status=(
+                    "Completed"
+                    if bool(existing.completed or incoming.completed)
+                    else str(getattr(incoming, "watch_status", "") or getattr(existing, "watch_status", "") or "")
+                ),
+                watched_eps=sorted(
+                    set(float(x) for x in (existing.watched_eps or []))
+                    | set(float(x) for x in (incoming.watched_eps or []))
+                ),
+                episode_progress=dict(existing.episode_progress or {}),
+            )
+            for k, v in (incoming.episode_progress or {}).items():
+                if k not in merged.episode_progress:
+                    merged.episode_progress[k] = v
+            existing_map[key] = merged
+            imported += 1
+
+        merged_history = list(existing_map.values())
+        self._save_history_entries_to_path(HISTORY_PATH, merged_history)
+        return {
+            "merged_history": merged_history,
+            "imported": imported,
+            "skipped_local": skipped_local,
+            "remote_planned": int(res.get("remote_planned", 0)),
+            "imported_planned": int(res.get("imported_planned", 0)),
+            "planned_missing_keys": list(res.get("planned_missing_keys") or []),
+            "skipped": int(res.get("skipped", 0)),
         }
 
     def _anilist_test_connection_worker(self, token: str) -> str:
@@ -2465,8 +2585,7 @@ class MainWindow(PlayerMixin, SearchMixin, DownloadMixin, UpdateMixin, HistoryMi
             if e is not None:
                 anime_name = e.name
                 progress, completed = self._history_entry_best_progress_and_completed_for_sync(e)
-                if not completed and progress <= 0:
-                    status = "PLANNING"
+                status = self._anilist_status_for_entry(e)
                 source = "history"
 
         debug_log(
@@ -2477,7 +2596,7 @@ class MainWindow(PlayerMixin, SearchMixin, DownloadMixin, UpdateMixin, HistoryMi
         fail_reason = ""
         if not anime_name:
             fail_reason = "no-anime"
-        elif status == "CURRENT" and int(progress) <= 0:
+        elif status in {"CURRENT", "COMPLETED"} and int(progress) <= 0:
             fail_reason = "no-progress"
         elif status == "CURRENT" and not bool(completed):
             fail_reason = "not-completed"
@@ -2496,6 +2615,12 @@ class MainWindow(PlayerMixin, SearchMixin, DownloadMixin, UpdateMixin, HistoryMi
 
         if status == "PLANNING":
             self.set_status(f"Sincronizzazione AniList: {anime_name} -> Planned…")
+        elif status == "PAUSED":
+            self.set_status(f"Sincronizzazione AniList: {anime_name} -> Paused…")
+        elif status == "DROPPED":
+            self.set_status(f"Sincronizzazione AniList: {anime_name} -> Dropped…")
+        elif status == "COMPLETED":
+            self.set_status(f"Sincronizzazione AniList: {anime_name} -> Completed ({progress})…")
         else:
             self.set_status(f"Sincronizzazione AniList: {anime_name} ep {progress}…")
         self._begin_request()
@@ -2505,6 +2630,12 @@ class MainWindow(PlayerMixin, SearchMixin, DownloadMixin, UpdateMixin, HistoryMi
             self._end_request()
             if st == "PLANNING":
                 self.set_status(f"Sincronizzazione AniList ok: {name} (Planned)")
+            elif st == "PAUSED":
+                self.set_status(f"Sincronizzazione AniList ok: {name} (Paused)")
+            elif st == "DROPPED":
+                self.set_status(f"Sincronizzazione AniList ok: {name} (Dropped)")
+            elif st == "COMPLETED":
+                self.set_status(f"Sincronizzazione AniList ok: {name} (Completed {ep})")
             else:
                 self.set_status(f"Sincronizzazione AniList ok: {name} ep {ep}")
 
@@ -2578,55 +2709,20 @@ class MainWindow(PlayerMixin, SearchMixin, DownloadMixin, UpdateMixin, HistoryMi
         lang_name = "DUB" if self.lang == LanguageTypeEnum.DUB else "SUB"
         self.set_status("Pull AniList -> Anigui in corso…")
         self._begin_request()
-        w = Worker(self._anilist_pull_worker, token, provider_name, lang_name)
+        local_snapshot = [HistoryEntry(**asdict(e)) for e in self.history._data]
+        w = Worker(
+            self._anilist_pull_and_merge_worker,
+            token,
+            provider_name,
+            lang_name,
+            local_snapshot,
+        )
 
         def on_ok(res: dict[str, Any]):
             self._end_request()
-            built = list(res.get("built") or [])
-            imported = 0
-            skipped_local = 0
-            existing_map: dict[tuple[str, str, str], HistoryEntry] = {
-                (e.provider, e.identifier, e.lang): e
-                for e in self.history._data
-            }
-            for incoming in built:
-                key = (incoming.provider, incoming.identifier, incoming.lang)
-                existing = existing_map.get(key)
-                if existing is None:
-                    self.history.upsert(incoming)
-                    existing_map[key] = incoming
-                    imported += 1
-                    continue
-
-                # Never downgrade local progress.
-                if float(existing.last_ep) > float(incoming.last_ep):
-                    skipped_local += 1
-                    continue
-
-                merged = HistoryEntry(
-                    provider=existing.provider,
-                    identifier=existing.identifier,
-                    name=existing.name or incoming.name,
-                    lang=existing.lang,
-                    last_ep=max(float(existing.last_ep), float(incoming.last_ep)),
-                    updated_at=time.time(),
-                    cover_url=existing.cover_url or incoming.cover_url,
-                    last_pos=existing.last_pos,
-                    last_duration=existing.last_duration,
-                    last_percent=max(float(existing.last_percent), float(incoming.last_percent)),
-                    completed=bool(existing.completed or incoming.completed),
-                    watched_eps=sorted(
-                        set(float(x) for x in (existing.watched_eps or []))
-                        | set(float(x) for x in (incoming.watched_eps or []))
-                    ),
-                    episode_progress=dict(existing.episode_progress or {}),
-                )
-                for k, v in (incoming.episode_progress or {}).items():
-                    if k not in merged.episode_progress:
-                        merged.episode_progress[k] = v
-                self.history.upsert(merged)
-                existing_map[key] = merged
-                imported += 1
+            self.history._data = list(res.get("merged_history") or [])
+            imported = int(res.get("imported", 0))
+            skipped_local = int(res.get("skipped_local", 0))
 
             self.refresh_history_ui()
             planned_missing = list(res.get("planned_missing_keys") or [])
@@ -3046,6 +3142,7 @@ class MainWindow(PlayerMixin, SearchMixin, DownloadMixin, UpdateMixin, HistoryMi
             last_duration=dur,
             last_percent=float(percent) if percent is not None else 0.0,
             completed=completed_now,
+            watch_status="Completed" if completed_now else "Watching",
             watched_eps=watched_eps,
             episode_progress=episode_progress,
         )

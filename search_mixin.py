@@ -1297,6 +1297,7 @@ class SearchMixin:
             last_duration=0.0,
             last_percent=0.0,
             completed=False,
+            watch_status="Planned",
             watched_eps=[],
             episode_progress={},
         )
@@ -1376,6 +1377,7 @@ class SearchMixin:
             last_duration=0.0,
             last_percent=100.0,
             completed=True,
+            watch_status="Completed",
             watched_eps=list(eps_values),
             episode_progress=ep_progress,
         )

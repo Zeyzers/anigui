@@ -1,13 +1,13 @@
 {
-    "version":  "1.1.1",
+    "version":  "1.1.5",
     "windows":  {
-                    "url":  "https://github.com/Zeyzers/anigui/releases/download/v1.1.1/AniguiApp.exe",
-                    "sha256":  "93e98b558a5ed41c98fc34792ea4667f8248ecda57a1c051e7868bf1d0a4cc6b"
+                    "url":  "https://github.com/Zeyzers/anigui/releases/download/v1.1.5/AniguiApp.exe",
+                    "sha256":  "021409441dfcc171b8a848c386bcaa7a2fc7e44ce9eded5b0af117e8887cf144"
                 },
     "linux":  {
                   "url":  "https://raw.githubusercontent.com/Zeyzers/anigui/main/app.py",
-                  "sha256":  "9e056670378d3a1897cb179559e958b8ec271c1f16ded95ec8d71cabd1c88be8"
+                  "sha256":  "aa8f2ca032d8201477e8cc7b649c8106d156e273f0ead4c6009de59ff518c428"
               },
     "page_url":  "https://github.com/Zeyzers/anigui/releases/latest",
-    "notes":  "Bugfix Missing Module on Update"
+    "notes":  "Added Paused and dropped, fixed UI block on import"
 }
