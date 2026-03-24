@@ -144,6 +144,4 @@ AniList integration is optional. If enabled:
 This repository is focused on the application source and runtime behavior.
 Windows binaries are distributed separately through releases.
 
-## Maintainers
 
-Release/build/update workflow notes now live in [MAINTAINING.md](/MAINTAINING.md).
