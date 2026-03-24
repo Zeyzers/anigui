@@ -13,7 +13,9 @@ from PySide6.QtWidgets import QListWidget, QListWidgetItem, QStyle
 
 from anipy_api.anime import Anime
 from anipy_api.provider import LanguageTypeEnum, get_provider
+from anilist_service import AniListService
 from components import SearchItem, Worker
+from history_service import find_history_entry, reconcile_history_entry
 from models import HistoryEntry
 
 
@@ -307,19 +309,54 @@ class SearchMixin:
         h = hashlib.sha1(url.encode("utf-8", errors="ignore")).hexdigest()
         return os.path.join(self.cover_cache_dir, f"{h}.img")
 
+    def _provider_cover_base_url(self, provider_name: str | None) -> str:
+        provider_s = str(provider_name or "").strip()
+        if not provider_s:
+            return ""
+        try:
+            if self._is_aw_provider_name(provider_s):
+                return str(self._aw_provider(provider_s).BASE_URL or "").rstrip("/")
+            provider = get_provider(provider_s)
+            return str(getattr(provider, "BASE_URL", "") or "").rstrip("/")
+        except Exception:
+            return ""
+
+    def _normalize_cover_url(self, url: str | None, provider_name: str | None = None) -> str | None:
+        raw = str(url or "").strip()
+        if not raw:
+            return None
+        if raw.startswith("//"):
+            return "https:" + raw
+        parts = urlsplit(raw)
+        if parts.scheme in {"http", "https"} and parts.netloc:
+            return raw
+        base_url = self._provider_cover_base_url(provider_name)
+        if base_url:
+            if raw.startswith("/"):
+                return base_url + raw
+            if not parts.scheme and not parts.netloc:
+                return base_url + "/" + raw.lstrip("/")
+        return None
+
+    def _extract_normalized_cover_url(self, obj: Any, provider_name: str | None = None) -> str | None:
+        return self._normalize_cover_url(self._extract_cover_url(obj), provider_name)
+
     def do_fetch_cover_for_item(self, item: SearchItem) -> tuple[bytes | None, bool]:
-        url = item.cover_url
+        url = self._normalize_cover_url(item.cover_url, item.source)
+        if url and item.cover_url != url:
+            item.cover_url = url
         if not url and self._is_aw_provider_name(item.source):
             url = self._aw_resolve_cover_url(item)
             if url:
-                item.cover_url = url
+                item.cover_url = self._normalize_cover_url(url, item.source) or url
+                url = item.cover_url
         if not url:
             try:
                 anime = self.build_anime_from_item(item)
                 info = anime.get_info()
                 url = getattr(info, "image", None)
                 if isinstance(url, str) and url.strip():
-                    item.cover_url = url.strip()
+                    item.cover_url = self._normalize_cover_url(url.strip(), item.source) or url.strip()
                     url = item.cover_url
             except Exception:
                 return None, False
@@ -331,7 +368,7 @@ class SearchMixin:
         self,
         entry: HistoryEntry,
     ) -> tuple[bytes | None, bool, str | None]:
-        url = entry.cover_url
+        url = self._normalize_cover_url(entry.cover_url, entry.provider)
         if not url:
             try:
                 if self._is_aw_provider_name(entry.provider):
@@ -351,6 +388,7 @@ class SearchMixin:
                         url = cand.strip()
             except Exception:
                 url = None
+        url = self._normalize_cover_url(url, entry.provider)
         if not url:
             return None, False, None
         data, from_cache = self.do_fetch_cover(url)
@@ -489,7 +527,7 @@ class SearchMixin:
                 r.name,
                 r.identifier,
                 r.languages,
-                cover_url=self._extract_cover_url(r),
+                cover_url=self._extract_normalized_cover_url(r, self.provider_name),
                 source=self.provider_name,
                 raw=r,
             )
@@ -550,7 +588,7 @@ class SearchMixin:
                         r.name,
                         r.identifier,
                         r.languages,
-                        cover_url=self._extract_cover_url(r),
+                        cover_url=self._extract_normalized_cover_url(r, self.provider_name),
                         source=self.provider_name,
                         raw=r,
                     )
@@ -618,7 +656,7 @@ class SearchMixin:
                         r.name,
                         r.identifier,
                         r.languages,
-                        cover_url=self._extract_cover_url(r),
+                        cover_url=self._extract_normalized_cover_url(r, self.provider_name),
                         source=self.provider_name,
                         raw=r,
                     )
@@ -680,11 +718,15 @@ class SearchMixin:
             or getattr(self.selected_anime, "_identifier", None)
             or getattr(self.selected_anime, "ref", "")
         )
+        anime_name = str(getattr(self.selected_anime, "name", "") or "").strip()
         lang_s = "SUB" if self.lang == LanguageTypeEnum.SUB else "DUB"
-        for e in self.history._data:
-            if e.provider == self.provider_name and e.identifier == ident and e.lang == lang_s:
-                return e
-        return None
+        return find_history_entry(
+            self.history.read(),
+            provider=self.provider_name,
+            identifier=ident,
+            lang=lang_s,
+            name=anime_name,
+        )
 
     def _episodes_list_for_history_entry(self, entry: HistoryEntry) -> list[float | int] | None:
         if not self.episodes_list:
@@ -790,6 +832,7 @@ class SearchMixin:
         self._pending_search_query = q
         if not q:
             self._last_search_query = None
+            self._last_search_provider = None
             if self._search_debounce_timer.isActive():
                 self._search_debounce_timer.stop()
             self.results.clear()
@@ -827,9 +870,11 @@ class SearchMixin:
         q = (query if query is not None else self.search_input.text()).strip()
         if not q:
             return
-        if q == self._last_search_query:
+        last_search_provider = getattr(self, "_last_search_provider", None)
+        if q == self._last_search_query and self.provider_name == last_search_provider:
             return
         self._last_search_query = q
+        self._last_search_provider = self.provider_name
         if self._search_debounce_timer.isActive():
             self._search_debounce_timer.stop()
 
@@ -1031,7 +1076,7 @@ class SearchMixin:
             self.refresh_favorites_ui()
         if self.tabs.widget(idx) is self.tab_history:
             self._save_current_progress(force=True)
-            self.refresh_history_ui()
+            self._queue_history_refresh()
             QTimer.singleShot(0, self._relayout_history_cards)
             QTimer.singleShot(80, self._relayout_history_cards)
 
@@ -1152,7 +1197,7 @@ class SearchMixin:
         self._begin_request()
         w = Worker(self._enrich_items_worker, items)
         w.ok.connect(lambda enriched, n=enrich_nonce, sn=nonce: self._on_items_enriched(n, sn, enriched))
-        w.err.connect(lambda _msg: None)
+        w.err.connect(self._on_enrich_error)
         self._track_worker(w)
         w.start()
 
@@ -1193,6 +1238,8 @@ class SearchMixin:
     def _on_enrich_error(self, _msg: str):
         self._end_request()
         self._filters_pending = False
+        self.notify_err(_msg)
+        self.set_status("Errore.")
 
     def on_pick_result(self, *_args):
         row = self.results.currentRow()
@@ -1285,21 +1332,13 @@ class SearchMixin:
             if self.selected_search_item
             else (existing.cover_url if existing is not None else None)
         )
-        entry = HistoryEntry(
-            provider=self.provider_name,
-            identifier=ident,
-            name=name or "anime",
-            lang=lang_s,
-            last_ep=0.0,
-            updated_at=now,
+        entry = AniListService.build_history_entry(
+            provider_name=(existing.provider if existing is not None else self.provider_name),
+            identifier=(existing.identifier if existing is not None else ident),
+            name=(existing.name if existing is not None and str(existing.name or "").strip() else (name or "anime")),
+            lang_name=lang_s,
             cover_url=cover_url,
-            last_pos=0.0,
-            last_duration=0.0,
-            last_percent=0.0,
-            completed=False,
-            watch_status="Planned",
-            watched_eps=[],
-            episode_progress={},
+            now_ts=now,
         )
         self.history.upsert(entry)
         self._anilist_sync_progress_async(entry, force=True)
@@ -1354,32 +1393,14 @@ class SearchMixin:
             )
             return
 
-        ep_progress: dict[str, dict[str, Any]] = {}
-        for epf in eps_values:
-            ep_key = str(int(epf)) if float(epf).is_integer() else str(epf)
-            ep_progress[ep_key] = {
-                "pos": 0.0,
-                "dur": 0.0,
-                "percent": 100.0,
-                "completed": True,
-                "updated_at": now,
-            }
-        last_ep = max(eps_values)
-        entry = HistoryEntry(
-            provider=self.provider_name,
-            identifier=ident,
-            name=name or "anime",
-            lang=lang_s,
-            last_ep=last_ep,
-            updated_at=now,
-            cover_url=cover_url,
-            last_pos=0.0,
-            last_duration=0.0,
-            last_percent=100.0,
-            completed=True,
-            watch_status="Completed",
+        entry = AniListService.build_completed_entry(
+            provider_name=(existing.provider if existing is not None else self.provider_name),
+            identifier=(existing.identifier if existing is not None else ident),
+            name=(existing.name if existing is not None and str(existing.name or "").strip() else (name or "anime")),
+            lang_name=lang_s,
             watched_eps=list(eps_values),
-            episode_progress=ep_progress,
+            cover_url=cover_url,
+            now_ts=now,
         )
         self.history.upsert(entry)
         self._anilist_sync_progress_async(entry, force=True)
@@ -1414,9 +1435,18 @@ class SearchMixin:
         self.episodes_list = eps
         hist_entry = self._current_history_entry()
         if hist_entry is not None and not self._incognito_enabled:
-            new_completed = self._entry_is_series_completed(hist_entry, eps)
-            if bool(hist_entry.completed) != bool(new_completed):
-                hist_entry.completed = bool(new_completed)
+            prev_completed = bool(hist_entry.completed)
+            prev_watch_status = str(getattr(hist_entry, "watch_status", "") or "")
+            reconcile = reconcile_history_entry(
+                hist_entry,
+                eps,
+            )
+            new_completed = reconcile.completed
+            new_watch_status = reconcile.watch_status
+            if (
+                prev_completed != bool(new_completed)
+                or prev_watch_status != new_watch_status
+            ):
                 try:
                     self.history.upsert(hist_entry)
                 except Exception:

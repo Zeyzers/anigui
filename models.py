@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import platform
+from collections.abc import Iterable
 from dataclasses import dataclass, asdict, field
 from typing import Any
 
@@ -62,6 +63,9 @@ class HistoryStore:
         self._data: list[HistoryEntry] = []
         self.load()
 
+    def _clone_entry(self, entry: HistoryEntry) -> HistoryEntry:
+        return HistoryEntry(**asdict(entry))
+
     def load(self) -> None:
         try:
             with open(self.path, "r", encoding="utf-8") as f:
@@ -88,10 +92,26 @@ class HistoryStore:
             )
         os.replace(tmp, self.path)
 
+    def read(self) -> list[HistoryEntry]:
+        return sorted(
+            (self._clone_entry(x) for x in self._data),
+            key=lambda x: x.updated_at,
+            reverse=True,
+        )
+
     def list(self) -> list[HistoryEntry]:
-        return sorted(self._data, key=lambda x: x.updated_at, reverse=True)
+        return self.read()
+
+    def replace(self, entries: Iterable[HistoryEntry]) -> None:
+        self._data = [self._clone_entry(entry) for entry in entries]
+        self.save()
+
+    def clear(self) -> None:
+        self._data = []
+        self.save()
 
     def upsert(self, entry: HistoryEntry) -> None:
+        entry = self._clone_entry(entry)
         for i, e in enumerate(self._data):
             if (
                 e.provider == entry.provider
@@ -101,6 +121,19 @@ class HistoryStore:
                 self._data[i] = entry
                 self.save()
                 return
+        try:
+            from anilist_service import AniListService
+
+            for i, e in enumerate(self._data):
+                if e.lang != entry.lang:
+                    continue
+                if not AniListService.title_matches(e.name, entry.name):
+                    continue
+                self._data[i] = AniListService.build_merged_entry(e, entry)
+                self.save()
+                return
+        except Exception:
+            pass
         self._data.append(entry)
         self.save()
 

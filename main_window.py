@@ -4,7 +4,6 @@ import json
 import os
 import sys
 import time
-import shutil
 import warnings
 import socket
 import tempfile
@@ -16,7 +15,6 @@ from urllib.parse import quote_plus, parse_qs, urlsplit
 import hashlib
 import importlib
 import re
-import zipfile
 import random
 from collections import defaultdict
 from dataclasses import asdict
@@ -56,6 +54,7 @@ from urllib3.exceptions import InsecureRequestWarning
 
 from anipy_api.provider import get_provider, LanguageTypeEnum
 from anipy_api.anime import Anime
+from anilist_service import AniListService
 from components import (
     SearchItem,
     OfflineAnimeItem,
@@ -80,6 +79,10 @@ from models import (
     HistoryEntry,
     HistoryStore,
 )
+from history_service import build_saved_progress_entry, find_history_entry
+from settings_service import RuntimeSettings, SettingsService
+from app_state_service import AppStateService
+from crash_logging import LoggingApplication, UiFreezeWatchdog, log_debug
 from services import APP_VERSION, UPDATE_MANIFEST_URL, UpdateService
 from download_mixin import DownloadMixin
 from update_mixin import UpdateMixin
@@ -97,10 +100,7 @@ warnings.filterwarnings(
 
 
 def debug_log(msg: str) -> None:
-    ts = time.strftime("%H:%M:%S")
-    ms = int((time.time() % 1) * 1000)
-    thread_name = threading.current_thread().name
-    print(f"[anigui {ts}.{ms:03d}] [{thread_name}] {msg}", flush=True)
+    log_debug(msg)
 
 # ---------------------------
 # Main App
@@ -127,37 +127,8 @@ class MainWindow(PlayerMixin, SearchMixin, DownloadMixin, UpdateMixin, HistoryMi
 
     def _init_settings_and_runtime(self):
         self._settings = self._load_settings()
-        self.provider_name = str(self._settings.get("default_provider", "allanime"))
-        if self.provider_name not in ("allanime", "aw_animeworld", "aw_animeunity"):
-            self.provider_name = "allanime"
-        lang_s = str(self._settings.get("default_lang", "SUB")).upper()
-        self.lang = LanguageTypeEnum.DUB if lang_s == "DUB" else LanguageTypeEnum.SUB
-        self.quality = str(self._settings.get("default_quality", "best"))
-        if self.quality not in ("best", "worst", "360", "480", "720", "1080"):
-            self.quality = "best"
-        try:
-            self._startup_parallel_downloads = int(self._settings.get("parallel_downloads", 2))
-        except Exception:
-            self._startup_parallel_downloads = 2
-        self._startup_parallel_downloads = max(1, min(4, self._startup_parallel_downloads))
-        self._scheduler_enabled = bool(self._settings.get("scheduler_enabled", False))
-        self._scheduler_start = str(self._settings.get("scheduler_start", "00:00"))
-        self._scheduler_end = str(self._settings.get("scheduler_end", "23:59"))
-        try:
-            self._integrity_min_mb = float(self._settings.get("integrity_min_mb", 2.0))
-        except Exception:
-            self._integrity_min_mb = 2.0
-        self._integrity_min_mb = max(0.0, self._integrity_min_mb)
-        try:
-            self._integrity_retry_count = int(self._settings.get("integrity_retry_count", 1))
-        except Exception:
-            self._integrity_retry_count = 1
-        self._integrity_retry_count = max(0, min(5, self._integrity_retry_count))
-        self._anilist_enabled = bool(self._settings.get("anilist_enabled", False))
-        self._anilist_token = str(self._settings.get("anilist_token", "")).strip()
-        self.app_language = str(self._settings.get("app_language", "it")).strip().lower()
-        if self.app_language not in ("it", "en"):
-            self.app_language = "it"
+        runtime = self._runtime_settings()
+        self._assign_runtime_settings(runtime, startup=True)
         self._incognito_enabled = False
 
         self.selected_anime: Optional[Any] = None
@@ -174,12 +145,31 @@ class MainWindow(PlayerMixin, SearchMixin, DownloadMixin, UpdateMixin, HistoryMi
         self.history = HistoryStore(HISTORY_PATH)
         self.cover_cache_dir = os.path.join(app_state_dir(), "covers")
         os.makedirs(self.cover_cache_dir, exist_ok=True)
-        dl_dir = str(self._settings.get("download_dir", "")).strip()
-        if dl_dir:
-            self.download_dir = os.path.abspath(os.path.expanduser(dl_dir))
-        else:
-            self.download_dir = os.path.join(app_state_dir(), "downloads")
         os.makedirs(self.download_dir, exist_ok=True)
+
+    def _runtime_settings(self) -> RuntimeSettings:
+        return SettingsService.runtime_state(
+            self._settings,
+            state_dir=app_state_dir(),
+            normalize_token=self._normalize_anilist_token,
+        )
+
+    def _assign_runtime_settings(self, runtime: RuntimeSettings, *, startup: bool = False) -> None:
+        self.download_dir = runtime.download_dir
+        self.provider_name = runtime.provider_name
+        self.lang = LanguageTypeEnum.DUB if runtime.lang_name == "DUB" else LanguageTypeEnum.SUB
+        self.quality = runtime.quality
+        if startup:
+            self._startup_parallel_downloads = runtime.parallel_downloads
+        self._max_parallel_downloads = runtime.parallel_downloads
+        self._scheduler_enabled = runtime.scheduler_enabled
+        self._scheduler_start = runtime.scheduler_start
+        self._scheduler_end = runtime.scheduler_end
+        self._integrity_min_mb = runtime.integrity_min_mb
+        self._integrity_retry_count = runtime.integrity_retry_count
+        self._anilist_enabled = runtime.anilist_enabled
+        self._anilist_token = runtime.anilist_token
+        self.app_language = runtime.app_language
 
     def _build_search_and_player_ui(self):
         root = QWidget()
@@ -1562,108 +1552,30 @@ class MainWindow(PlayerMixin, SearchMixin, DownloadMixin, UpdateMixin, HistoryMi
             self.lbl_incognito_badge.setVisible(False)
             self.set_status("Modalita Incognito disattivata.")
 
-    def _anilist_headers(self) -> dict[str, str]:
-        return self._anilist_headers_for_token(self._anilist_token)
-
     def _anilist_headers_for_token(self, token: str | None) -> dict[str, str]:
-        h = {
-            "Content-Type": "application/json",
-            "Accept": "application/json",
-            "User-Agent": "Anigui/1.0 (+https://anilist.co)",
-        }
-        t = self._normalize_anilist_token(token)
-        if t:
-            h["Authorization"] = f"Bearer {t}"
-        return h
+        return AniListService.headers_for_token(token)
 
     @staticmethod
     def _normalize_anilist_token(token: str | None) -> str:
-        t = (token or "").strip()
-        if not t:
-            return ""
-        if t.lower().startswith("bearer "):
-            t = t[7:].strip()
-        # If user pasted full redirect URL or fragment, extract access_token.
-        if "access_token=" in t:
-            try:
-                frag = urlsplit(t).fragment or ""
-                if frag:
-                    q = parse_qs(frag)
-                    val = q.get("access_token", [])
-                    if val and val[0]:
-                        return str(val[0]).strip()
-                # fallback: parse from raw string
-                q = parse_qs(t.replace("#", "&").replace("?", "&"))
-                val = q.get("access_token", [])
-                if val and val[0]:
-                    return str(val[0]).strip()
-            except Exception:
-                pass
-        return t
+        return AniListService.normalize_token(token)
 
     def _anilist_graphql(self, query: str, variables: dict[str, Any], token: str | None = None) -> dict[str, Any]:
-        req = urllib.request.Request(
-            "https://graphql.anilist.co",
-            data=json.dumps({"query": query, "variables": variables}).encode("utf-8"),
-            headers=self._anilist_headers_for_token(token if token is not None else self._anilist_token),
-            method="POST",
+        return AniListService.graphql(
+            query,
+            variables,
+            token=token if token is not None else self._anilist_token,
         )
-        try:
-            with urllib.request.urlopen(req, timeout=12.0) as r:
-                raw = r.read()
-        except urllib.error.HTTPError as ex:
-            body = ""
-            try:
-                body = ex.read().decode("utf-8", errors="ignore").strip()
-            except Exception:
-                body = ""
-            msg = f"HTTP {ex.code} {ex.reason}"
-            if body:
-                msg = f"{msg} - {body[:400]}"
-            raise RuntimeError(msg) from ex
-        payload = json.loads(raw.decode("utf-8", errors="ignore"))
-        if isinstance(payload, dict) and payload.get("errors"):
-            raise RuntimeError(str(payload["errors"]))
-        if not isinstance(payload, dict):
-            raise RuntimeError("AniList response non valida.")
-        return payload
 
     @staticmethod
     def _watch_status_from_anilist(remote_status: str) -> str:
-        rs = str(remote_status or "").strip().upper()
-        if rs == "PLANNING":
-            return "Planned"
-        if rs == "PAUSED":
-            return "Paused"
-        if rs == "DROPPED":
-            return "Dropped"
-        if rs == "COMPLETED":
-            return "Completed"
-        return "Watching"
+        return AniListService.watch_status_from_remote(remote_status)
 
     @staticmethod
     def _anilist_status_for_entry(entry: HistoryEntry) -> str:
-        watch_status = str(getattr(entry, "watch_status", "") or "").strip().casefold()
-        prog = 0
-        try:
-            prog = int(max(0.0, float(entry.last_ep)))
-        except Exception:
-            prog = 0
-        has_progress = prog > 0 or bool(entry.watched_eps)
-        if bool(entry.completed) or watch_status == "completed":
-            return "COMPLETED"
-        if watch_status == "paused":
-            return "PAUSED"
-        if watch_status == "dropped":
-            return "DROPPED"
-        if watch_status in {"planned", "planning"} and not has_progress:
-            return "PLANNING"
-        if has_progress:
-            return "CURRENT"
-        return "PLANNING"
+        return AniListService.status_for_entry(entry)
 
     def _anilist_sync_key(self, entry: HistoryEntry) -> str:
-        return f"{entry.provider}:{entry.identifier}:{entry.lang}"
+        return AniListService.sync_key(entry)
 
     def _anilist_sync_progress_async(self, entry: HistoryEntry, force: bool = False):
         if self._incognito_enabled:
@@ -1720,49 +1632,13 @@ class MainWindow(PlayerMixin, SearchMixin, DownloadMixin, UpdateMixin, HistoryMi
         status: str,
         token: str | None = None,
     ) -> dict[str, Any]:
-        cache_key = self._norm_title(anime_name)
-        media_id = self._anilist_media_id_cache.get(cache_key)
-        if media_id is None:
-            q = """
-            query ($search: String) {
-              Media(search: $search, type: ANIME) { id }
-            }
-            """
-            payload = self._anilist_graphql(q, {"search": anime_name}, token=token)
-            media = (
-                payload.get("data", {}).get("Media")
-                if isinstance(payload.get("data"), dict)
-                else None
-            )
-            if not isinstance(media, dict) or not media.get("id"):
-                raise RuntimeError(f"AniList match non trovato: {anime_name}")
-            media_id = int(media["id"])
-            self._anilist_media_id_cache[cache_key] = media_id
-
-        m = """
-        mutation ($mediaId: Int, $status: MediaListStatus, $progress: Int) {
-          SaveMediaListEntry(mediaId: $mediaId, status: $status, progress: $progress) {
-            id
-            status
-            progress
-          }
-        }
-        """
-        payload = self._anilist_graphql(
-            m,
-            {
-                "mediaId": int(media_id),
-                "status": status,
-                "progress": int(
-                    max(
-                        0 if str(status).upper() in {"PLANNING", "PAUSED", "DROPPED"} else 1,
-                        progress,
-                    )
-                ),
-            },
+        return AniListService.save_media_list_entry(
+            anime_name=anime_name,
+            progress=progress,
+            status=status,
             token=token,
+            media_id_cache=self._anilist_media_id_cache,
         )
-        return payload.get("data", {})
 
     def _anilist_active_token_from_ui(self) -> str:
         tok = ""
@@ -1774,33 +1650,11 @@ class MainWindow(PlayerMixin, SearchMixin, DownloadMixin, UpdateMixin, HistoryMi
 
     @staticmethod
     def _norm_title(s: str) -> str:
-        s = (s or "").strip().lower()
-        s = re.sub(r"[^a-z0-9]+", " ", s)
-        return re.sub(r"\s+", " ", s).strip()
+        return AniListService.normalize_title(s)
 
     @staticmethod
     def _extract_season_number(title: str) -> int | None:
-        s = str(title or "").strip().lower()
-        if not s:
-            return None
-        patterns = [
-            r"\b(\d+)(?:st|nd|rd|th)\s+season\b",
-            r"\bseason\s*(\d+)\b",
-            r"\bs(\d+)\b",
-            r"\bpart\s*(\d+)\b",
-            r"第\s*(\d+)\s*期",
-            r"\b(\d+)\s*기\b",
-        ]
-        for p in patterns:
-            m = re.search(p, s, flags=re.IGNORECASE)
-            if m:
-                try:
-                    n = int(m.group(1))
-                    if n > 0:
-                        return n
-                except Exception:
-                    continue
-        return None
+        return AniListService.extract_season_number(title)
 
     @staticmethod
     def _planned_identifier_from_titles(
@@ -1808,13 +1662,7 @@ class MainWindow(PlayerMixin, SearchMixin, DownloadMixin, UpdateMixin, HistoryMi
         media_id: int | None = None,
         entry_id: int | None = None,
     ) -> str:
-        if media_id is not None and int(media_id) > 0:
-            return f"planned:anilist:{int(media_id)}"
-        if entry_id is not None and int(entry_id) > 0:
-            return f"planned:anilist-entry:{int(entry_id)}"
-        base = " | ".join([t.strip() for t in titles if str(t).strip()]) or "planned"
-        h = hashlib.sha1(base.encode("utf-8", errors="ignore")).hexdigest()[:16]
-        return f"planned:{h}"
+        return AniListService.planned_identifier(titles, media_id=media_id, entry_id=entry_id)
 
     @staticmethod
     def _anilist_unmatched_identifier(
@@ -1822,36 +1670,10 @@ class MainWindow(PlayerMixin, SearchMixin, DownloadMixin, UpdateMixin, HistoryMi
         media_id: int | None = None,
         entry_id: int | None = None,
     ) -> str:
-        if media_id is not None and int(media_id) > 0:
-            return f"anilist-only:{int(media_id)}"
-        if entry_id is not None and int(entry_id) > 0:
-            return f"anilist-only-entry:{int(entry_id)}"
-        base = " | ".join([t.strip() for t in titles if str(t).strip()]) or "anilist-only"
-        h = hashlib.sha1(base.encode("utf-8", errors="ignore")).hexdigest()[:16]
-        return f"anilist-only:{h}"
+        return AniListService.unmatched_identifier(titles, media_id=media_id, entry_id=entry_id)
 
     def _title_search_candidates(self, titles: list[str]) -> list[str]:
-        out: list[str] = []
-        seen: set[str] = set()
-        for t in titles:
-            s = str(t or "").strip()
-            if not s:
-                continue
-            variants = [s]
-            # Strip common season markers to improve provider matching.
-            cleaned = re.sub(r"\b\d+(st|nd|rd|th)\s+season\b", "", s, flags=re.IGNORECASE)
-            cleaned = re.sub(r"\b(season|stagione)\s*\d+\b", "", cleaned, flags=re.IGNORECASE)
-            cleaned = re.sub(r"\bs\d+\b", "", cleaned, flags=re.IGNORECASE)
-            cleaned = re.sub(r"\b(part|cour)\s*\d+\b", "", cleaned, flags=re.IGNORECASE)
-            cleaned = re.sub(r"\s+", " ", cleaned).strip(" -:|")
-            if cleaned and cleaned.casefold() != s.casefold():
-                variants.append(cleaned)
-            for v in variants:
-                key = v.casefold()
-                if key and key not in seen:
-                    seen.add(key)
-                    out.append(v)
-        return out
+        return AniListService.title_search_candidates(titles)
 
     def _search_items_for_provider(
         self,
@@ -1891,7 +1713,7 @@ class MainWindow(PlayerMixin, SearchMixin, DownloadMixin, UpdateMixin, HistoryMi
                 r.name,
                 r.identifier,
                 r.languages,
-                cover_url=self._extract_cover_url(r),
+                cover_url=self._extract_normalized_cover_url(r, provider_name),
                 source=provider_name,
                 raw=r,
             )
@@ -1903,155 +1725,10 @@ class MainWindow(PlayerMixin, SearchMixin, DownloadMixin, UpdateMixin, HistoryMi
         titles: list[str],
         items: list[SearchItem],
     ) -> SearchItem | None:
-        if not items:
-            return None
-        norm_titles = [self._norm_title(t) for t in titles if t and self._norm_title(t)]
-        if not norm_titles:
-            return items[0]
-        target_season: int | None = None
-        for t in titles:
-            sn = self._extract_season_number(t)
-            if sn is not None:
-                target_season = sn
-                break
+        return AniListService.pick_best_item_for_titles(titles, items)
 
-        best: SearchItem | None = None
-        best_score = -10**9
-        for it in items:
-            name_norm = self._norm_title(it.name)
-            if not name_norm:
-                continue
-            score = 0
-            for t in norm_titles:
-                if name_norm == t:
-                    score = max(score, 100)
-                elif t in name_norm or name_norm in t:
-                    score = max(score, 65)
-                else:
-                    tset = set(t.split())
-                    nset = set(name_norm.split())
-                    if tset and nset:
-                        overlap = len(tset & nset)
-                        if overlap > 0:
-                            ratio = overlap / max(len(tset), len(nset))
-                            score = max(score, int(ratio * 70))
-
-            if target_season is not None and target_season > 1:
-                cand_season = self._extract_season_number(it.name)
-                if cand_season is None:
-                    score -= 35
-                elif cand_season != target_season:
-                    score -= 90
-
-            if score > best_score:
-                best_score = score
-                best = it
-
-        if best is None:
-            return None
-        # Avoid blind fallback to the first search item: poor matches caused wrong merges.
-        if best_score < 45:
-            return None
-        return best
-
-    def _anilist_fetch_progress_entries(self, token: str) -> list[dict[str, Any]]:
-        q = """
-        query {
-          Viewer {
-            id
-            name
-            mediaListOptions { scoreFormat }
-          }
-          MediaListCollection(
-            userId: 0,
-            type: ANIME,
-            status_in: [CURRENT, REPEATING, COMPLETED, PAUSED, DROPPED, PLANNING]
-          ) {
-            lists {
-              status
-              entries {
-                id
-                progress
-                media {
-                  id
-                  synonyms
-                  title { romaji english native }
-                }
-              }
-            }
-          }
-        }
-        """
-        # AniList does not accept userId:0, resolve viewer first.
-        v = self._anilist_graphql("query { Viewer { id name } }", {}, token=token)
-        viewer = v.get("data", {}).get("Viewer") if isinstance(v.get("data"), dict) else None
-        if not isinstance(viewer, dict) or not viewer.get("id"):
-            raise RuntimeError("Impossibile leggere Viewer AniList.")
-        user_id = int(viewer["id"])
-        q2 = """
-        query ($userId: Int) {
-          MediaListCollection(
-            userId: $userId,
-            type: ANIME,
-            status_in: [CURRENT, REPEATING, COMPLETED, PAUSED, DROPPED, PLANNING]
-          ) {
-            lists {
-              status
-              entries {
-                id
-                progress
-                media {
-                  id
-                  synonyms
-                  title { romaji english native }
-                }
-              }
-            }
-          }
-        }
-        """
-        payload = self._anilist_graphql(q2, {"userId": user_id}, token=token)
-        coll = payload.get("data", {}).get("MediaListCollection") if isinstance(payload.get("data"), dict) else None
-        lists = coll.get("lists", []) if isinstance(coll, dict) else []
-        out: list[dict[str, Any]] = []
-        for lst in lists:
-            if not isinstance(lst, dict):
-                continue
-            status = str(lst.get("status", "") or "")
-            for e in lst.get("entries", []) or []:
-                if not isinstance(e, dict):
-                    continue
-                entry_id = int(e.get("id") or 0) if isinstance(e.get("id"), (int, float, str)) else 0
-                prog = int(e.get("progress") or 0)
-                media = e.get("media") if isinstance(e.get("media"), dict) else {}
-                media_id = int(media.get("id") or 0) if isinstance(media.get("id"), (int, float, str)) else 0
-                title = media.get("title") if isinstance(media.get("title"), dict) else {}
-                titles = [
-                    str(title.get("english") or "").strip(),
-                    str(title.get("romaji") or "").strip(),
-                    str(title.get("native") or "").strip(),
-                ]
-                for syn in (media.get("synonyms") or []):
-                    s = str(syn or "").strip()
-                    if s:
-                        titles.append(s)
-                titles = [t for t in titles if t]
-                if not titles and media_id > 0:
-                    titles = [f"AniList #{media_id}"]
-                if not titles and entry_id > 0:
-                    titles = [f"AniList entry #{entry_id}"]
-                if not titles:
-                    titles = ["Planned anime"]
-                out.append(
-                    {
-                        "status": status,
-                        "progress": prog,
-                        "titles": titles,
-                        "media_id": media_id,
-                        "entry_id": entry_id,
-                    }
-                )
-        return out
+    def _anilist_fetch_progress_entries(self, token: str) -> list[Any]:
+        return AniListService.fetch_progress_entries(token)
 
     def _anilist_featured_recommendations_worker(
         self,
@@ -2112,7 +1789,7 @@ class MainWindow(PlayerMixin, SearchMixin, DownloadMixin, UpdateMixin, HistoryMi
             "PLANNING": 0.0,
         }
         local_excluded_titles: set[str] = set()
-        for e in self.history._data:
+        for e in self.history.read():
             n = self._norm_title(getattr(e, "name", ""))
             if n:
                 # Exclude both already watched and already planned local entries.
@@ -2320,281 +1997,7 @@ class MainWindow(PlayerMixin, SearchMixin, DownloadMixin, UpdateMixin, HistoryMi
         provider_name: str,
         lang_name: str,
     ) -> dict[str, Any]:
-        lang = LanguageTypeEnum.DUB if lang_name == "DUB" else LanguageTypeEnum.SUB
-        rows = self._anilist_fetch_progress_entries(token)
-        search_cache: dict[tuple[str, bool], list[SearchItem]] = {}
-        history_name_idx: dict[str, HistoryEntry] = {}
-        for e in self.history._data:
-            if e.provider != provider_name or e.lang != lang_name:
-                continue
-            n = self._norm_title(e.name)
-            if not n:
-                continue
-            prev = history_name_idx.get(n)
-            if prev is None or float(getattr(prev, "updated_at", 0.0) or 0.0) < float(getattr(e, "updated_at", 0.0) or 0.0):
-                history_name_idx[n] = e
-
-        def provider_search_cached(query: str, strict_lang: bool = True) -> list[SearchItem]:
-            key = ((query or "").strip().casefold(), bool(strict_lang))
-            if not key[0]:
-                return []
-            if key in search_cache:
-                return search_cache[key]
-            try:
-                items = self._search_items_for_provider(query, provider_name, lang, strict_lang=strict_lang)
-            except Exception:
-                items = []
-            search_cache[key] = items
-            return items
-
-        seen_ident: set[str] = set()
-        built: list[HistoryEntry] = []
-        cleanup_placeholder_keys: set[tuple[str, str, str]] = set()
-        skipped = 0
-        remote_planned = 0
-        imported_planned = 0
-        planned_all_keys: list[str] = []
-        planned_all_seen: set[str] = set()
-        planned_imported_keys: set[str] = set()
-        for row in rows:
-            titles = list(row.get("titles", []))
-            search_queries = self._title_search_candidates(titles)
-            progress = int(row.get("progress") or 0)
-            media_id = int(row.get("media_id") or 0)
-            entry_id = int(row.get("entry_id") or 0)
-            remote_status = str(row.get("status") or "").upper()
-            local_status = self._watch_status_from_anilist(remote_status)
-            if media_id > 0:
-                for t in titles:
-                    nt = self._norm_title(t)
-                    if nt and nt not in self._anilist_media_id_cache:
-                        self._anilist_media_id_cache[nt] = media_id
-            planned_key = ""
-            if remote_status == "PLANNING":
-                if media_id > 0:
-                    planned_key = f"m:{media_id}"
-                elif entry_id > 0:
-                    planned_key = f"e:{entry_id}"
-                else:
-                    planned_key = f"t:{self._planned_identifier_from_titles(titles)}"
-            if remote_status == "PLANNING":
-                remote_planned += 1
-                if planned_key and planned_key not in planned_all_seen:
-                    planned_all_seen.add(planned_key)
-                    planned_all_keys.append(planned_key)
-            found: SearchItem | None = None
-            # Fast-path: if already imported locally for this provider/lang, skip provider network search.
-            for t in titles:
-                nt = self._norm_title(t)
-                if not nt:
-                    continue
-                existing_local = history_name_idx.get(nt)
-                if (
-                    existing_local is not None
-                    and not str(existing_local.identifier).startswith("planned:")
-                    and not str(existing_local.identifier).startswith("anilist-only:")
-                ):
-                    found = SearchItem(
-                        name=existing_local.name,
-                        identifier=existing_local.identifier,
-                        languages={LanguageTypeEnum.DUB if lang_name == "DUB" else LanguageTypeEnum.SUB},
-                        cover_url=existing_local.cover_url,
-                        source=provider_name,
-                        raw=None,
-                    )
-                    break
-            for t in search_queries:
-                if found is not None:
-                    break
-                items = provider_search_cached(t, strict_lang=True)
-                found = self._pick_best_item_for_titles(titles, items)
-                if found is not None:
-                    break
-            if found is None:
-                for t in search_queries:
-                    items = provider_search_cached(t, strict_lang=False)
-                    found = self._pick_best_item_for_titles(titles, items)
-                    if found is not None:
-                        break
-            if found is None:
-                if remote_status == "PLANNING":
-                    placeholder_id = self._planned_identifier_from_titles(
-                        titles,
-                        media_id=media_id,
-                        entry_id=entry_id,
-                    )
-                    uniq = f"{provider_name}:{placeholder_id}:{lang_name}"
-                    if uniq in seen_ident:
-                        if planned_key:
-                            planned_imported_keys.add(planned_key)
-                        continue
-                    seen_ident.add(uniq)
-                    fallback_name = next((t for t in titles if t.strip()), f"AniList #{media_id}" if media_id > 0 else "Planned anime")
-                    built.append(
-                        HistoryEntry(
-                            provider=provider_name,
-                            identifier=placeholder_id,
-                            name=fallback_name,
-                            lang=lang_name,
-                            last_ep=0.0,
-                            updated_at=time.time(),
-                            cover_url=None,
-                            last_pos=0.0,
-                            last_duration=0.0,
-                            last_percent=0.0,
-                            completed=False,
-                            watch_status=local_status,
-                            watched_eps=[],
-                            episode_progress={},
-                        )
-                    )
-                    imported_planned += 1
-                    if planned_key:
-                        planned_imported_keys.add(planned_key)
-                    continue
-                placeholder_id = self._anilist_unmatched_identifier(
-                    titles,
-                    media_id=media_id,
-                    entry_id=entry_id,
-                )
-                uniq = f"{provider_name}:{placeholder_id}:{lang_name}"
-                if uniq in seen_ident:
-                    continue
-                seen_ident.add(uniq)
-                progress = max(0, int(progress))
-                prog = float(progress)
-                watched = [float(i) for i in range(1, int(prog) + 1)] if progress <= 400 else [prog]
-                if progress <= 0:
-                    watched = []
-                ep_prog: dict[str, dict[str, Any]] = {}
-                for epf in watched[:400]:
-                    ep_key = str(int(epf)) if float(epf).is_integer() else str(epf)
-                    ep_prog[ep_key] = {
-                        "pos": 0.0,
-                        "dur": 0.0,
-                        "percent": 100.0,
-                        "completed": True,
-                        "updated_at": time.time(),
-                    }
-                fallback_name = next((t for t in titles if t.strip()), f"AniList #{media_id}" if media_id > 0 else "AniList title")
-                built.append(
-                    HistoryEntry(
-                        provider=provider_name,
-                        identifier=placeholder_id,
-                        name=fallback_name,
-                        lang=lang_name,
-                        last_ep=prog,
-                        updated_at=time.time(),
-                        cover_url=None,
-                        last_pos=0.0,
-                        last_duration=0.0,
-                        last_percent=100.0 if progress > 0 else 0.0,
-                        completed=(remote_status == "COMPLETED"),
-                        watch_status=local_status,
-                        watched_eps=watched,
-                        episode_progress=ep_prog,
-                    )
-                )
-                skipped += 1
-                continue
-            uniq = f"{provider_name}:{found.identifier}:{lang_name}"
-            if uniq in seen_ident:
-                if remote_status == "PLANNING":
-                    # Provider dedupe collision: still keep this AniList planning entry via placeholder.
-                    placeholder_id = self._planned_identifier_from_titles(
-                        titles,
-                        media_id=media_id,
-                        entry_id=entry_id,
-                    )
-                    puniq = f"{provider_name}:{placeholder_id}:{lang_name}"
-                    if puniq not in seen_ident:
-                        seen_ident.add(puniq)
-                        fallback_name = next((t for t in titles if t.strip()), f"AniList #{media_id}" if media_id > 0 else "Planned anime")
-                        built.append(
-                            HistoryEntry(
-                                provider=provider_name,
-                                identifier=placeholder_id,
-                                name=fallback_name,
-                                lang=lang_name,
-                                last_ep=0.0,
-                                updated_at=time.time(),
-                                cover_url=None,
-                                last_pos=0.0,
-                                last_duration=0.0,
-                                last_percent=0.0,
-                                completed=False,
-                                watch_status=local_status,
-                                watched_eps=[],
-                                episode_progress={},
-                            )
-                        )
-                    imported_planned += 1
-                    if planned_key:
-                        planned_imported_keys.add(planned_key)
-                continue
-            seen_ident.add(uniq)
-            # If this AniList row is now matched to a real provider identifier,
-            # remove stale placeholder entries for the same AniList item/title.
-            placeholder_ids: list[str] = []
-            if media_id > 0:
-                placeholder_ids.append(f"planned:anilist:{media_id}")
-                placeholder_ids.append(f"anilist-only:{media_id}")
-            if entry_id > 0:
-                placeholder_ids.append(f"planned:anilist-entry:{entry_id}")
-                placeholder_ids.append(f"anilist-only-entry:{entry_id}")
-            placeholder_ids.append(self._planned_identifier_from_titles(titles))
-            placeholder_ids.append(self._anilist_unmatched_identifier(titles))
-            for pid in placeholder_ids:
-                if pid:
-                    cleanup_placeholder_keys.add((provider_name, pid, lang_name))
-
-            progress = max(0, int(progress))
-            prog = float(progress)
-            watched = [float(i) for i in range(1, int(prog) + 1)] if progress <= 400 else [prog]
-            if progress <= 0:
-                watched = []
-            ep_prog: dict[str, dict[str, Any]] = {}
-            for epf in watched[:400]:
-                ep_key = str(int(epf)) if float(epf).is_integer() else str(epf)
-                ep_prog[ep_key] = {
-                    "pos": 0.0,
-                    "dur": 0.0,
-                    "percent": 100.0,
-                    "completed": True,
-                    "updated_at": time.time(),
-                }
-            built.append(
-                HistoryEntry(
-                    provider=provider_name,
-                    identifier=found.identifier,
-                    name=found.name,
-                    lang=lang_name,
-                    last_ep=prog,
-                    updated_at=time.time(),
-                    cover_url=found.cover_url,
-                    last_pos=0.0,
-                    last_duration=0.0,
-                    last_percent=100.0 if progress > 0 else 0.0,
-                    completed=(remote_status == "COMPLETED"),
-                    watch_status=local_status,
-                    watched_eps=watched,
-                    episode_progress=ep_prog,
-                )
-            )
-            if remote_status == "PLANNING":
-                imported_planned += 1
-                if planned_key:
-                    planned_imported_keys.add(planned_key)
-        planned_missing_keys = [k for k in planned_all_keys if k not in planned_imported_keys]
-        return {
-            "total_remote": len(rows),
-            "built": built,
-            "cleanup_placeholder_keys": list(cleanup_placeholder_keys),
-            "skipped": skipped,
-            "remote_planned": remote_planned,
-            "imported_planned": imported_planned,
-            "planned_missing_keys": planned_missing_keys,
-        }
+        return {"rows": self._anilist_fetch_progress_entries(token)}
 
     @staticmethod
     def _save_history_entries_to_path(path: str, entries: list[HistoryEntry]) -> None:
@@ -2615,175 +2018,44 @@ class MainWindow(PlayerMixin, SearchMixin, DownloadMixin, UpdateMixin, HistoryMi
         lang_name: str,
         local_history: list[HistoryEntry],
     ) -> dict[str, Any]:
-        res = self._anilist_pull_worker(token, provider_name, lang_name)
-        built = list(res.get("built") or [])
-        skipped_local = 0
-        imported = 0
-
-        existing_map: dict[tuple[str, str, str], HistoryEntry] = {
-            (e.provider, e.identifier, e.lang): e
-            for e in local_history
-        }
-        for raw_key in (res.get("cleanup_placeholder_keys") or []):
-            try:
-                p, i, l = raw_key
-                existing_map.pop((str(p), str(i), str(l)), None)
-            except Exception:
-                continue
-        for incoming in built:
-            key = (incoming.provider, incoming.identifier, incoming.lang)
-            existing = existing_map.get(key)
-            if existing is None:
-                existing_map[key] = incoming
-                imported += 1
-                continue
-
-            # Never downgrade local progress.
-            if float(existing.last_ep) > float(incoming.last_ep):
-                skipped_local += 1
-                continue
-
-            merged = HistoryEntry(
-                provider=existing.provider,
-                identifier=existing.identifier,
-                name=existing.name or incoming.name,
-                lang=existing.lang,
-                last_ep=max(float(existing.last_ep), float(incoming.last_ep)),
-                updated_at=time.time(),
-                cover_url=existing.cover_url or incoming.cover_url,
-                last_pos=existing.last_pos,
-                last_duration=existing.last_duration,
-                last_percent=max(float(existing.last_percent), float(incoming.last_percent)),
-                completed=bool(existing.completed or incoming.completed),
-                watch_status=(
-                    "Completed"
-                    if bool(existing.completed or incoming.completed)
-                    else str(getattr(incoming, "watch_status", "") or getattr(existing, "watch_status", "") or "")
-                ),
-                watched_eps=sorted(
-                    set(float(x) for x in (existing.watched_eps or []))
-                    | set(float(x) for x in (incoming.watched_eps or []))
-                ),
-                episode_progress=dict(existing.episode_progress or {}),
-            )
-            for k, v in (incoming.episode_progress or {}).items():
-                if k not in merged.episode_progress:
-                    merged.episode_progress[k] = v
-            existing_map[key] = merged
-            imported += 1
-
-        merged_history = list(existing_map.values())
-        merged_history = self._dedupe_history_entries_prefer_cover(merged_history)
-        self._save_history_entries_to_path(HISTORY_PATH, merged_history)
-        return {
-            "merged_history": merged_history,
-            "imported": imported,
-            "skipped_local": skipped_local,
-            "remote_planned": int(res.get("remote_planned", 0)),
-            "imported_planned": int(res.get("imported_planned", 0)),
-            "planned_missing_keys": list(res.get("planned_missing_keys") or []),
-            "skipped": int(res.get("skipped", 0)),
-        }
+        rows = list(AniListService.fetch_progress_entries(token) or [])
+        lang = LanguageTypeEnum.DUB if lang_name == "DUB" else LanguageTypeEnum.SUB
+        merged = AniListService.merge_history_entries(
+            rows,
+            local_history,
+            provider_name=provider_name,
+            lang_name=lang_name,
+            search_provider=lambda query, strict_lang=True: self._search_items_for_provider(
+                query,
+                provider_name,
+                lang,
+                strict_lang=strict_lang,
+            ),
+            search_lang=lang,
+        )
+        self._save_history_entries_to_path(HISTORY_PATH, merged.get("merged_history") or [])
+        return merged
 
     def _dedupe_history_entries_prefer_cover(
         self,
         entries: list[HistoryEntry],
     ) -> list[HistoryEntry]:
-        def status_rank(e: HistoryEntry) -> int:
-            s = str(getattr(e, "watch_status", "") or "").strip().casefold()
-            if bool(e.completed) or s == "completed":
-                return 5
-            if s == "watching":
-                return 4
-            if s == "paused":
-                return 3
-            if s == "planned":
-                return 2
-            if s == "dropped":
-                return 1
-            return 0
-
-        def progress_rank(e: HistoryEntry) -> tuple[float, int]:
-            try:
-                last_ep = float(getattr(e, "last_ep", 0.0) or 0.0)
-            except Exception:
-                last_ep = 0.0
-            seen = len(getattr(e, "watched_eps", []) or [])
-            return last_ep, seen
-
-        def engagement_rank(e: HistoryEntry) -> tuple[int, float, int]:
-            pr = progress_rank(e)
-            return status_rank(e), pr[0], pr[1]
-
-        grouped: dict[tuple[str, str, str], HistoryEntry] = {}
-        passthrough: list[HistoryEntry] = []
-        for e in entries:
-            provider = str(getattr(e, "provider", "") or "")
-            lang = str(getattr(e, "lang", "") or "")
-            name_norm = self._norm_title(str(getattr(e, "name", "") or ""))
-            if not name_norm:
-                passthrough.append(e)
-                continue
-            key = (provider, lang, name_norm)
-
-            prev = grouped.get(key)
-            if prev is None:
-                grouped[key] = e
-                continue
-
-            prev_has_cover = bool(str(getattr(prev, "cover_url", "") or "").strip())
-            cur_has_cover = bool(str(getattr(e, "cover_url", "") or "").strip())
-            choose_cur = False
-            prev_eng = engagement_rank(prev)
-            cur_eng = engagement_rank(e)
-            if cur_eng != prev_eng:
-                choose_cur = cur_eng > prev_eng
-            elif cur_has_cover != prev_has_cover:
-                choose_cur = cur_has_cover
-            else:
-                choose_cur = float(getattr(e, "updated_at", 0.0) or 0.0) > float(
-                    getattr(prev, "updated_at", 0.0) or 0.0
-                )
-            if choose_cur:
-                grouped[key] = e
-
-        out = list(grouped.values()) + passthrough
-        out.sort(key=lambda x: float(getattr(x, "updated_at", 0.0) or 0.0), reverse=True)
-        return out
+        return AniListService.dedupe_history(entries)
 
     def _run_history_maintenance(self) -> None:
-        current = list(self.history._data)
+        current = self.history.read()
         deduped = self._dedupe_history_entries_prefer_cover(current)
         if len(deduped) != len(current):
-            self.history._data = deduped
             try:
-                self.history.save()
+                self.history.replace(deduped)
             except Exception:
                 pass
 
     def _anilist_test_connection_worker(self, token: str) -> str:
-        q = """
-        query {
-          Viewer { id name }
-        }
-        """
-        payload = self._anilist_graphql(q, {}, token=token)
-        viewer = payload.get("data", {}).get("Viewer") if isinstance(payload.get("data"), dict) else None
-        if not isinstance(viewer, dict) or not viewer.get("name"):
-            raise RuntimeError("AniList viewer non disponibile.")
-        return str(viewer.get("name"))
+        return AniListService.viewer_name(token)
 
     def _anilist_viewer_worker(self, token: str) -> tuple[int, str]:
-        q = """
-        query {
-          Viewer { id name }
-        }
-        """
-        payload = self._anilist_graphql(q, {}, token=token)
-        viewer = payload.get("data", {}).get("Viewer") if isinstance(payload.get("data"), dict) else None
-        if not isinstance(viewer, dict) or not viewer.get("id"):
-            raise RuntimeError("AniList viewer non disponibile.")
-        return int(viewer.get("id")), str(viewer.get("name") or "")
+        return AniListService.viewer(token)
 
     def _debug_log_anilist_viewer_startup(self):
         token = self._anilist_active_token_from_ui()
@@ -2853,7 +2125,8 @@ class MainWindow(PlayerMixin, SearchMixin, DownloadMixin, UpdateMixin, HistoryMi
             try:
                 pos = float(self.player.get_time_pos() or 0.0)
                 dur = float(self.player.get_duration() or 0.0)
-                completed = self._is_episode_completed(pos, dur)
+                percent = float(self.player.get_percent_pos() or 0.0)
+                completed = AniListService.episode_is_completed(pos, dur, percent)
                 source = "active-player"
             except Exception:
                 completed = False
@@ -2956,32 +2229,7 @@ class MainWindow(PlayerMixin, SearchMixin, DownloadMixin, UpdateMixin, HistoryMi
         return best
 
     def _history_entry_best_progress_and_completed_for_sync(self, entry: HistoryEntry) -> tuple[int, bool]:
-        vals: list[float] = []
-        completed_vals: list[float] = []
-        try:
-            w = [float(x) for x in (entry.watched_eps or [])]
-            vals.extend(w)
-            completed_vals.extend(w)
-        except Exception:
-            pass
-        ep_map = entry.episode_progress if isinstance(entry.episode_progress, dict) else {}
-        for k, v in ep_map.items():
-            try:
-                epf = float(k)
-            except Exception:
-                continue
-            if isinstance(v, dict):
-                comp = bool(v.get("completed", False))
-                vals.append(epf)
-                if comp:
-                    completed_vals.append(epf)
-        if not vals:
-            return 0, False
-        best = max(vals)
-        best_completed = max(completed_vals) if completed_vals else 0.0
-        if best_completed > 0:
-            return int(max(1, best_completed)), True
-        return int(max(1, best)), False
+        return AniListService.best_progress_and_completed(entry)
 
     def on_anilist_pull_from_remote(self):
         if self._incognito_enabled:
@@ -2995,7 +2243,7 @@ class MainWindow(PlayerMixin, SearchMixin, DownloadMixin, UpdateMixin, HistoryMi
         lang_name = "DUB" if self.lang == LanguageTypeEnum.DUB else "SUB"
         self.set_status("Pull AniList -> Anigui in corso…")
         self._begin_request()
-        local_snapshot = [HistoryEntry(**asdict(e)) for e in self.history._data]
+        local_snapshot = self.history.read()
         w = Worker(
             self._anilist_pull_and_merge_worker,
             token,
@@ -3006,7 +2254,7 @@ class MainWindow(PlayerMixin, SearchMixin, DownloadMixin, UpdateMixin, HistoryMi
 
         def on_ok(res: dict[str, Any]):
             self._end_request()
-            self.history._data = list(res.get("merged_history") or [])
+            self.history.replace(res.get("merged_history") or [])
             imported = int(res.get("imported", 0))
             skipped_local = int(res.get("skipped_local", 0))
 
@@ -3305,20 +2553,11 @@ class MainWindow(PlayerMixin, SearchMixin, DownloadMixin, UpdateMixin, HistoryMi
 
     @staticmethod
     def _is_episode_completed(pos: float, dur: float) -> bool:
-        if dur <= 0:
-            return False
-        remaining = max(0.0, dur - pos)
-        return (pos / dur) >= 0.97 or remaining <= 90.0
+        return AniListService.episode_is_completed(pos, dur)
 
     @staticmethod
     def _is_episode_completed_by_percent(percent: float | None) -> bool:
-        if percent is None:
-            return False
-        try:
-            p = float(percent)
-        except Exception:
-            return False
-        return p >= 97.0
+        return AniListService.episode_is_completed(None, None, percent)
 
     def _save_current_progress(self, force: bool = False):
         if self._incognito_enabled:
@@ -3350,102 +2589,61 @@ class MainWindow(PlayerMixin, SearchMixin, DownloadMixin, UpdateMixin, HistoryMi
         ident_s = str(identifier)
         lang_s = "SUB" if self.lang == LanguageTypeEnum.SUB else "DUB"
 
-        prev_entry: HistoryEntry | None = None
-        for e in self.history._data:
-            if e.provider == self.provider_name and e.identifier == ident_s and e.lang == lang_s:
-                prev_entry = e
-                break
-
-        dur: float | None
-        if dur_raw is not None:
-            dur = max(0.0, float(dur_raw))
-        elif prev_entry is not None:
-            dur = max(0.0, float(prev_entry.last_duration))
-        else:
-            dur = None
-
-        percent: float | None = None
-        if percent_raw is not None:
-            try:
-                percent = max(0.0, min(100.0, float(percent_raw)))
-            except Exception:
-                percent = None
-        elif prev_entry is not None and float(getattr(prev_entry, "last_percent", 0.0) or 0.0) > 0.0:
-            percent = max(0.0, min(100.0, float(prev_entry.last_percent)))
-
-        pos: float | None = None
-        if pos_raw is not None:
-            pos = max(0.0, float(pos_raw))
-        elif dur is not None and dur > 0 and percent_raw is not None:
-            try:
-                pos = max(0.0, min(dur, dur * (float(percent_raw) / 100.0)))
-            except Exception:
-                pos = None
-        elif prev_entry is not None:
-            pos = max(0.0, float(prev_entry.last_pos))
-
-        # if we still cannot resolve a timeline position and no percent exists, skip save
-        if pos is None and percent is None:
-            return
-        if pos is None:
-            pos = max(0.0, float(prev_entry.last_pos)) if prev_entry is not None else 0.0
-        if dur is None:
-            dur = 0.0
+        prev_entry = find_history_entry(
+            self.history.read(),
+            provider=self.provider_name,
+            identifier=ident_s,
+            lang=lang_s,
+            name=self.selected_anime.name,
+        )
 
         if not force:
-            pos_delta_small = abs(pos - self._last_progress_pos) < 5.0
-            pct_now = float(percent) if percent is not None else -1.0
-            pct_delta_small = abs(pct_now - self._last_progress_percent) < 1.0
+            pos_guess = (
+                max(0.0, float(pos_raw))
+                if pos_raw is not None
+                else max(0.0, float(getattr(prev_entry, "last_pos", 0.0) or 0.0))
+                if prev_entry is not None
+                else 0.0
+            )
+            pct_guess = (
+                max(0.0, min(100.0, float(percent_raw)))
+                if percent_raw is not None
+                else max(0.0, min(100.0, float(getattr(prev_entry, "last_percent", 0.0) or 0.0)))
+                if prev_entry is not None and float(getattr(prev_entry, "last_percent", 0.0) or 0.0) > 0.0
+                else -1.0
+            )
+            pos_delta_small = abs(pos_guess - self._last_progress_pos) < 5.0
+            pct_delta_small = abs(pct_guess - self._last_progress_percent) < 1.0
             if now - self._last_progress_save_at < 5.0 and pos_delta_small and pct_delta_small:
                 return
 
-        watched_eps: list[float] = list(prev_entry.watched_eps) if prev_entry is not None else []
-        episode_progress: dict[str, dict[str, Any]] = (
-            dict(prev_entry.episode_progress)
-            if prev_entry is not None and isinstance(prev_entry.episode_progress, dict)
-            else {}
-        )
         cover_url = (
             getattr(self.selected_search_item, "cover_url", None)
             if self.selected_search_item
             else (prev_entry.cover_url if prev_entry is not None else None)
         )
-        episode_completed_now = self._is_episode_completed(pos, dur) or self._is_episode_completed_by_percent(percent)
-        # Do not auto-mark series as completed only because the current local max episode is watched:
-        # ongoing shows would be misclassified. Series completion stays explicit/manual or remote-driven.
-        completed_now = bool(prev_entry.completed) if prev_entry is not None else False
-
-        entry = HistoryEntry(
-            provider=self.provider_name,
-            identifier=ident_s,
-            name=self.selected_anime.name,
-            lang=lang_s,
+        result = build_saved_progress_entry(
+            provider_name=(prev_entry.provider if prev_entry is not None else self.provider_name),
+            identifier=(prev_entry.identifier if prev_entry is not None else ident_s),
+            name=(prev_entry.name if prev_entry is not None and str(prev_entry.name or "").strip() else self.selected_anime.name),
+            lang_name=lang_s,
+            current_ep=self.current_ep,
+            pos_raw=pos_raw,
+            dur_raw=dur_raw,
+            percent_raw=percent_raw,
+            prev_entry=prev_entry,
             cover_url=cover_url,
-            last_ep=float(self.current_ep),
-            updated_at=now,
-            last_pos=pos,
-            last_duration=dur,
-            last_percent=float(percent) if percent is not None else 0.0,
-            completed=completed_now,
-            watch_status="Completed" if completed_now else "Watching",
-            watched_eps=watched_eps,
-            episode_progress=episode_progress,
+            now_ts=now,
         )
-        self._entry_set_episode_progress(
-            entry,
-            self.current_ep,
-            pos=pos,
-            dur=dur,
-            percent=float(percent) if percent is not None else 0.0,
-            completed=episode_completed_now,
-        )
-        if episode_completed_now:
-            self._entry_add_watched_ep(entry, self.current_ep)
+        if result is None:
+            return
+
+        entry = result.entry
         self.history.upsert(entry)
         self._anilist_sync_progress_async(entry, force=force)
         self._last_progress_save_at = now
-        self._last_progress_pos = pos
-        self._last_progress_percent = float(percent) if percent is not None else -1.0
+        self._last_progress_pos = result.pos
+        self._last_progress_percent = result.percent
         if force:
             self.refresh_history_ui()
 
@@ -3549,25 +2747,10 @@ class MainWindow(PlayerMixin, SearchMixin, DownloadMixin, UpdateMixin, HistoryMi
             return None
 
     def _entry_watched_eps_set(self, entry: HistoryEntry) -> set[float]:
-        out: set[float] = set()
-        for v in (entry.watched_eps or []):
-            f = self._to_ep_float(v)
-            if f is not None:
-                out.add(f)
-        # Legacy fallback: consider only current episode as seen if the entry is completed.
-        if not out and bool(entry.completed):
-            last = self._to_ep_float(entry.last_ep)
-            if last is not None and last > 0:
-                out.add(float(last))
-        return out
+        return AniListService.watched_eps_set(entry)
 
     def _entry_add_watched_ep(self, entry: HistoryEntry, ep: float | int | str | None) -> None:
-        f = self._to_ep_float(ep)
-        if f is None or f <= 0:
-            return
-        eps = self._entry_watched_eps_set(entry)
-        eps.add(float(f))
-        entry.watched_eps = sorted(eps)
+        AniListService.add_watched_ep(entry, ep)
 
     @staticmethod
     def _ep_key(ep: float | int | str | None) -> str:
@@ -3580,26 +2763,14 @@ class MainWindow(PlayerMixin, SearchMixin, DownloadMixin, UpdateMixin, HistoryMi
             return str(ep or "")
 
     def _entry_episode_progress_map(self, entry: HistoryEntry) -> dict[float, dict[str, Any]]:
-        out: dict[float, dict[str, Any]] = {}
-        raw = entry.episode_progress if isinstance(entry.episode_progress, dict) else {}
-        for k, v in raw.items():
-            try:
-                epf = float(k)
-            except Exception:
-                continue
-            if isinstance(v, dict):
-                out[epf] = dict(v)
-        return out
+        return AniListService.episode_progress_map(entry)
 
     def _entry_get_episode_progress(
         self,
         entry: HistoryEntry,
         ep: float | int | str | None,
     ) -> dict[str, Any] | None:
-        key = self._ep_key(ep)
-        raw = entry.episode_progress if isinstance(entry.episode_progress, dict) else {}
-        val = raw.get(key)
-        return dict(val) if isinstance(val, dict) else None
+        return AniListService.episode_progress(entry, ep)
 
     def _entry_set_episode_progress(
         self,
@@ -3610,15 +2781,14 @@ class MainWindow(PlayerMixin, SearchMixin, DownloadMixin, UpdateMixin, HistoryMi
         percent: float,
         completed: bool,
     ) -> None:
-        raw = dict(entry.episode_progress) if isinstance(entry.episode_progress, dict) else {}
-        raw[self._ep_key(ep)] = {
-            "pos": float(max(0.0, pos)),
-            "dur": float(max(0.0, dur)),
-            "percent": float(max(0.0, min(100.0, percent))),
-            "completed": bool(completed),
-            "updated_at": time.time(),
-        }
-        entry.episode_progress = raw
+        AniListService.set_episode_progress(
+            entry,
+            ep,
+            pos=pos,
+            dur=dur,
+            percent=percent,
+            completed=completed,
+        )
 
     def _is_last_available_episode(
         self,
@@ -3645,21 +2815,7 @@ class MainWindow(PlayerMixin, SearchMixin, DownloadMixin, UpdateMixin, HistoryMi
         entry: HistoryEntry,
         available_eps: list[float | int] | None,
     ) -> bool:
-        if not available_eps:
-            return False
-        vals: list[float] = []
-        for x in available_eps:
-            xf = self._to_ep_float(x)
-            if xf is not None:
-                vals.append(xf)
-        if not vals:
-            return False
-        max_ep = max(vals)
-        watched = self._entry_watched_eps_set(entry)
-        if any(abs(max_ep - w) < 1e-6 for w in watched):
-            return True
-        p = self._entry_get_episode_progress(entry, max_ep)
-        return bool(p and p.get("completed", False))
+        return AniListService.series_completed(entry, available_eps)
 
     def _is_aw_provider_name(self, name: str) -> bool:
         return name in ("aw_animeworld", "aw_animeunity")
@@ -3922,80 +3078,29 @@ class MainWindow(PlayerMixin, SearchMixin, DownloadMixin, UpdateMixin, HistoryMi
 
     @staticmethod
     def _default_settings_dict() -> dict[str, Any]:
-        return {
-            "download_dir": os.path.join(app_state_dir(), "downloads"),
-            "default_provider": "allanime",
-            "default_lang": "SUB",
-            "default_quality": "best",
-            "parallel_downloads": 2,
-            "scheduler_enabled": False,
-            "scheduler_start": "00:00",
-            "scheduler_end": "23:59",
-            "integrity_min_mb": 2.0,
-            "integrity_retry_count": 1,
-            "anilist_enabled": False,
-            "anilist_token": "",
-            "app_language": "it",
-        }
+        return SettingsService.default_settings(state_dir=app_state_dir())
 
     def _load_settings(self) -> dict[str, Any]:
-        base = self._default_settings_dict()
-        try:
-            with open(SETTINGS_PATH, "r", encoding="utf-8") as f:
-                raw = json.load(f)
-            if isinstance(raw, dict):
-                base.update(raw)
-        except Exception:
-            pass
-        return base
+        return SettingsService.load(
+            path=SETTINGS_PATH,
+            state_dir=app_state_dir(),
+            normalize_token=self._normalize_anilist_token,
+        )
 
     def _save_settings(self, settings: dict[str, Any]):
         if self._incognito_enabled:
             return
-        tmp = SETTINGS_PATH + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(settings, f, ensure_ascii=False, indent=2)
-        os.replace(tmp, SETTINGS_PATH)
-        self._settings = dict(settings)
+        self._settings = SettingsService.save(
+            settings,
+            path=SETTINGS_PATH,
+            state_dir=app_state_dir(),
+            normalize_token=self._normalize_anilist_token,
+        )
 
     def _apply_runtime_from_settings(self):
-        dl_dir = str(self._settings.get("download_dir", "")).strip()
-        if dl_dir:
-            self.download_dir = os.path.abspath(os.path.expanduser(dl_dir))
-        else:
-            self.download_dir = os.path.join(app_state_dir(), "downloads")
+        runtime = self._runtime_settings()
+        MainWindow._assign_runtime_settings(self, runtime)
         os.makedirs(self.download_dir, exist_ok=True)
-        self.provider_name = str(self._settings.get("default_provider", "allanime"))
-        if self.provider_name not in ("allanime", "aw_animeworld", "aw_animeunity"):
-            self.provider_name = "allanime"
-        lang_s = str(self._settings.get("default_lang", "SUB")).upper()
-        self.lang = LanguageTypeEnum.DUB if lang_s == "DUB" else LanguageTypeEnum.SUB
-        self.quality = str(self._settings.get("default_quality", "best"))
-        if self.quality not in ("best", "worst", "360", "480", "720", "1080"):
-            self.quality = "best"
-        try:
-            self._max_parallel_downloads = int(self._settings.get("parallel_downloads", 2))
-        except Exception:
-            self._max_parallel_downloads = 2
-        self._max_parallel_downloads = max(1, min(4, self._max_parallel_downloads))
-        self._scheduler_enabled = bool(self._settings.get("scheduler_enabled", False))
-        self._scheduler_start = str(self._settings.get("scheduler_start", "00:00"))
-        self._scheduler_end = str(self._settings.get("scheduler_end", "23:59"))
-        try:
-            self._integrity_min_mb = float(self._settings.get("integrity_min_mb", 2.0))
-        except Exception:
-            self._integrity_min_mb = 2.0
-        self._integrity_min_mb = max(0.0, self._integrity_min_mb)
-        try:
-            self._integrity_retry_count = int(self._settings.get("integrity_retry_count", 1))
-        except Exception:
-            self._integrity_retry_count = 1
-        self._integrity_retry_count = max(0, min(5, self._integrity_retry_count))
-        self._anilist_enabled = bool(self._settings.get("anilist_enabled", False))
-        self._anilist_token = str(self._settings.get("anilist_token", "")).strip()
-        self.app_language = str(self._settings.get("app_language", "it")).strip().lower()
-        if self.app_language not in ("it", "en"):
-            self.app_language = "it"
 
         pidx = self.provider_combo.findData(self.provider_name)
         if pidx >= 0:
@@ -4059,88 +3164,49 @@ class MainWindow(PlayerMixin, SearchMixin, DownloadMixin, UpdateMixin, HistoryMi
         if not download_dir:
             self.notify_err("Download directory non valido.")
             return
-        download_dir = os.path.abspath(os.path.expanduser(download_dir))
-        try:
-            os.makedirs(download_dir, exist_ok=True)
-        except Exception as ex:
-            self.notify_err(f"Impossibile creare la cartella download: {ex}")
-            return
-
-        provider = str(self.combo_settings_provider.currentData() or "allanime")
-        lang_s = str(self.combo_settings_lang.currentData() or "SUB").upper()
-        quality = str(self.combo_settings_quality.currentData() or "best")
-        parallel = int(self.combo_settings_parallel.currentData() or 2)
-        parallel = max(1, min(4, parallel))
-        scheduler_enabled = bool(self.combo_settings_scheduler_enabled.currentData())
-        scheduler_start = self.input_settings_scheduler_start.text().strip()
-        scheduler_end = self.input_settings_scheduler_end.text().strip()
-        if scheduler_enabled:
-            if self._parse_hhmm(scheduler_start) is None or self._parse_hhmm(scheduler_end) is None:
-                self.notify_err("Formato scheduler non valido. Usa HH:MM (es. 23:30).")
-                return
         try:
             integrity_min_mb = float(self.input_settings_integrity_min_mb.text().strip())
         except Exception:
             integrity_min_mb = self._integrity_min_mb
-        integrity_min_mb = max(0.0, integrity_min_mb)
-        integrity_retry_count = int(self.combo_settings_integrity_retries.currentData() or 1)
-        integrity_retry_count = max(0, min(5, integrity_retry_count))
-        anilist_enabled = bool(self.combo_settings_anilist_enabled.currentData())
-        anilist_token = self.input_settings_anilist_token.text().strip()
-        app_language = str(self.combo_settings_app_language.currentData() or "it").strip().lower()
-        if app_language not in ("it", "en"):
-            app_language = "it"
-        if anilist_enabled and not anilist_token:
-            self.notify_err("Inserisci un AniList token oppure disattiva AniList sync.")
+        try:
+            prepared = SettingsService.prepare_for_save(
+                download_dir=download_dir,
+                provider_name=str(self.combo_settings_provider.currentData() or "allanime"),
+                lang_name=str(self.combo_settings_lang.currentData() or "SUB").upper(),
+                quality=str(self.combo_settings_quality.currentData() or "best"),
+                parallel_downloads=int(self.combo_settings_parallel.currentData() or 2),
+                scheduler_enabled=bool(self.combo_settings_scheduler_enabled.currentData()),
+                scheduler_start=self.input_settings_scheduler_start.text().strip(),
+                scheduler_end=self.input_settings_scheduler_end.text().strip(),
+                integrity_min_mb=integrity_min_mb,
+                integrity_retry_count=int(self.combo_settings_integrity_retries.currentData() or 1),
+                anilist_enabled=bool(self.combo_settings_anilist_enabled.currentData()),
+                anilist_token=self.input_settings_anilist_token.text(),
+                app_language=str(self.combo_settings_app_language.currentData() or "it").strip().lower(),
+                normalize_token=self._normalize_anilist_token,
+            )
+        except ValueError as ex:
+            if str(ex) == "invalid_scheduler":
+                self.notify_err("Formato scheduler non valido. Usa HH:MM (es. 23:30).")
+            elif str(ex) == "missing_anilist_token":
+                self.notify_err("Inserisci un AniList token oppure disattiva AniList sync.")
+            else:
+                self.notify_err("Download directory non valido.")
             return
 
-        settings = {
-            "download_dir": download_dir,
-            "default_provider": provider,
-            "default_lang": lang_s,
-            "default_quality": quality,
-            "parallel_downloads": parallel,
-            "scheduler_enabled": scheduler_enabled,
-            "scheduler_start": scheduler_start,
-            "scheduler_end": scheduler_end,
-            "integrity_min_mb": integrity_min_mb,
-            "integrity_retry_count": integrity_retry_count,
-            "anilist_enabled": anilist_enabled,
-            "anilist_token": anilist_token,
-            "app_language": app_language,
-        }
         try:
-            self._save_settings(settings)
+            os.makedirs(prepared.runtime.download_dir, exist_ok=True)
+        except Exception as ex:
+            self.notify_err(f"Impossibile creare la cartella download: {ex}")
+            return
+
+        try:
+            self._save_settings(prepared.settings)
         except Exception as ex:
             self.notify_err(f"Errore salvataggio settings: {ex}")
             return
 
-        self.download_dir = download_dir
-        self.provider_name = provider
-        self.lang = LanguageTypeEnum.DUB if lang_s == "DUB" else LanguageTypeEnum.SUB
-        self.quality = quality
-        self._max_parallel_downloads = parallel
-        self._scheduler_enabled = scheduler_enabled
-        self._scheduler_start = scheduler_start
-        self._scheduler_end = scheduler_end
-        self._integrity_min_mb = integrity_min_mb
-        self._integrity_retry_count = integrity_retry_count
-        self._anilist_enabled = anilist_enabled
-        self._anilist_token = anilist_token
-        self.app_language = app_language
-
-        pidx = self.provider_combo.findData(self.provider_name)
-        if pidx >= 0:
-            self.provider_combo.setCurrentIndex(pidx)
-        self.lang_combo.setCurrentIndex(1 if self.lang == LanguageTypeEnum.DUB else 0)
-        qidx = self.quality_combo.findText(self.quality)
-        if qidx >= 0:
-            self.quality_combo.setCurrentIndex(qidx)
-        self.combo_dl_parallel.setCurrentIndex(self._max_parallel_downloads - 1)
-        self._apply_provider_ui_state()
-        self._apply_app_language_ui()
-        self._update_featured_tab_visibility()
-        self._featured_loaded = False
+        self._apply_runtime_from_settings()
         self.refresh_history_ui()
         self.refresh_offline_library()
         self.set_status(self._tr("Impostazioni salvate.", "Settings saved."))
@@ -4178,29 +3244,16 @@ class MainWindow(PlayerMixin, SearchMixin, DownloadMixin, UpdateMixin, HistoryMi
 
     @staticmethod
     def _parse_hhmm(v: str) -> tuple[int, int] | None:
-        m = re.fullmatch(r"(\d{2}):(\d{2})", v.strip())
-        if not m:
-            return None
-        hh = int(m.group(1))
-        mm = int(m.group(2))
-        if hh < 0 or hh > 23 or mm < 0 or mm > 59:
-            return None
-        return hh, mm
+        return SettingsService.parse_hhmm(v)
 
     def _is_scheduler_window_open(self) -> bool:
-        if not self._scheduler_enabled:
-            return True
-        s = self._parse_hhmm(self._scheduler_start)
-        e = self._parse_hhmm(self._scheduler_end)
-        if s is None or e is None:
-            return True
         now = time.localtime()
-        cur = now.tm_hour * 60 + now.tm_min
-        start = s[0] * 60 + s[1]
-        end = e[0] * 60 + e[1]
-        if start <= end:
-            return start <= cur <= end
-        return cur >= start or cur <= end
+        return SettingsService.scheduler_window_open(
+            scheduler_enabled=self._scheduler_enabled,
+            scheduler_start=self._scheduler_start,
+            scheduler_end=self._scheduler_end,
+            current_minutes=(now.tm_hour * 60 + now.tm_min),
+        )
 
     def _scheduler_tick(self):
         if self._scheduler_enabled and self._is_scheduler_window_open():
@@ -4219,25 +3272,18 @@ class MainWindow(PlayerMixin, SearchMixin, DownloadMixin, UpdateMixin, HistoryMi
         if not out_path.lower().endswith(".zip"):
             out_path += ".zip"
         try:
-            with zipfile.ZipFile(out_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
-                base = app_state_dir()
-                files = [
-                    ("history.json", HISTORY_PATH),
-                    ("search_history.json", SEARCH_HISTORY_PATH),
-                    ("offline_covers.json", OFFLINE_COVERS_MAP_PATH),
-                    ("settings.json", SETTINGS_PATH),
-                    ("favorites.json", FAVORITES_PATH),
-                    ("metadata_cache.json", METADATA_CACHE_PATH),
-                ]
-                for arc, src in files:
-                    if os.path.exists(src):
-                        zf.write(src, arcname=arc)
-                covers_dir = os.path.join(base, "covers")
-                if os.path.isdir(covers_dir):
-                    for fn in os.listdir(covers_dir):
-                        src = os.path.join(covers_dir, fn)
-                        if os.path.isfile(src):
-                            zf.write(src, arcname=os.path.join("covers", fn))
+            AppStateService.create_backup_archive(
+                out_path,
+                state_dir=app_state_dir(),
+                path_overrides={
+                    "history.json": HISTORY_PATH,
+                    "search_history.json": SEARCH_HISTORY_PATH,
+                    "offline_covers.json": OFFLINE_COVERS_MAP_PATH,
+                    "settings.json": SETTINGS_PATH,
+                    "favorites.json": FAVORITES_PATH,
+                    "metadata_cache.json": METADATA_CACHE_PATH,
+                },
+            )
             self.set_status(f"Backup creato: {out_path}")
         except Exception as ex:
             self.notify_err(f"Backup fallito: {ex}")
@@ -4255,30 +3301,18 @@ class MainWindow(PlayerMixin, SearchMixin, DownloadMixin, UpdateMixin, HistoryMi
         if not in_path:
             return
         try:
-            with zipfile.ZipFile(in_path, "r") as zf:
-                members = set(zf.namelist())
-                base = app_state_dir()
-                mapping = {
+            AppStateService.restore_backup_archive(
+                in_path,
+                state_dir=app_state_dir(),
+                path_overrides={
                     "history.json": HISTORY_PATH,
                     "search_history.json": SEARCH_HISTORY_PATH,
                     "offline_covers.json": OFFLINE_COVERS_MAP_PATH,
                     "settings.json": SETTINGS_PATH,
                     "favorites.json": FAVORITES_PATH,
                     "metadata_cache.json": METADATA_CACHE_PATH,
-                }
-                for arc, dst in mapping.items():
-                    if arc in members:
-                        os.makedirs(os.path.dirname(dst), exist_ok=True)
-                        with zf.open(arc, "r") as src, open(dst, "wb") as out:
-                            out.write(src.read())
-                for m in members:
-                    if not m.startswith("covers/") or m.endswith("/"):
-                        continue
-                    rel = m[len("covers/"):]
-                    dst = os.path.join(base, "covers", os.path.basename(rel))
-                    os.makedirs(os.path.dirname(dst), exist_ok=True)
-                    with zf.open(m, "r") as src, open(dst, "wb") as out:
-                        out.write(src.read())
+                },
+            )
 
             # reload in-memory data from restored files
             self.history.load()
@@ -4437,30 +3471,18 @@ class MainWindow(PlayerMixin, SearchMixin, DownloadMixin, UpdateMixin, HistoryMi
         return 7 * 24 * 3600.0
 
     def _metadata_key(self, source: str, identifier: str) -> str:
-        return f"{source}:{identifier}"
+        return AppStateService.metadata_cache_key(source, identifier)
 
     def _load_metadata_cache(self):
-        try:
-            with open(METADATA_CACHE_PATH, "r", encoding="utf-8") as f:
-                raw = json.load(f)
-            self._metadata_cache = raw if isinstance(raw, dict) else {}
-        except Exception:
-            self._metadata_cache = {}
+        self._metadata_cache = AppStateService.load_metadata_cache(METADATA_CACHE_PATH)
 
     def _save_metadata_cache(self):
         if self._incognito_enabled:
             return
-        tmp = METADATA_CACHE_PATH + ".tmp"
         try:
-            with open(tmp, "w", encoding="utf-8") as f:
-                json.dump(self._metadata_cache, f, ensure_ascii=False, indent=2)
-            os.replace(tmp, METADATA_CACHE_PATH)
+            AppStateService.save_metadata_cache(self._metadata_cache, METADATA_CACHE_PATH)
         except Exception:
-            try:
-                if os.path.exists(tmp):
-                    os.remove(tmp)
-            except Exception:
-                pass
+            pass
 
     def _apply_metadata_cache_to_item(self, it: SearchItem):
         key = self._metadata_key(it.source, it.identifier)
@@ -4483,102 +3505,55 @@ class MainWindow(PlayerMixin, SearchMixin, DownloadMixin, UpdateMixin, HistoryMi
         if self._incognito_enabled:
             return
         key = self._metadata_key(it.source, it.identifier)
-        self._metadata_cache[key] = {
-            "updated_at": time.time(),
-            "year": it.year,
-            "season": it.season,
-            "studio": it.studio,
-            "rating": it.rating,
-        }
+        self._metadata_cache[key] = AppStateService.metadata_cache_entry(
+            updated_at=time.time(),
+            year=it.year,
+            season=it.season,
+            studio=it.studio,
+            rating=it.rating,
+        )
         self._save_metadata_cache()
 
     def _load_search_history(self):
-        try:
-            with open(SEARCH_HISTORY_PATH, "r", encoding="utf-8") as f:
-                data = json.load(f)
-            if isinstance(data, list):
-                self._recent_queries = [str(x) for x in data if str(x).strip()]
-        except FileNotFoundError:
-            self._recent_queries = []
-        except Exception:
-            self._recent_queries = []
+        self._recent_queries = AppStateService.load_search_history(SEARCH_HISTORY_PATH)
 
     def _save_search_history(self):
         if self._incognito_enabled:
             return
-        tmp = SEARCH_HISTORY_PATH + ".tmp"
         try:
-            with open(tmp, "w", encoding="utf-8") as f:
-                json.dump(self._recent_queries, f, ensure_ascii=False, indent=2)
-            os.replace(tmp, SEARCH_HISTORY_PATH)
+            AppStateService.save_search_history(self._recent_queries, SEARCH_HISTORY_PATH)
         except Exception:
-            try:
-                if os.path.exists(tmp):
-                    os.remove(tmp)
-            except Exception:
-                pass
+            pass
 
     def _load_offline_covers_map(self):
-        try:
-            with open(OFFLINE_COVERS_MAP_PATH, "r", encoding="utf-8") as f:
-                data = json.load(f)
-            if isinstance(data, dict):
-                loaded = {
-                    str(k): str(v)
-                    for k, v in data.items()
-                    if str(k).strip() and str(v).strip()
-                }
-                changed = False
-                for k, v in list(loaded.items()):
-                    # migrate legacy URL entries to local *.img cache path
-                    if not v.lower().endswith(".img"):
-                        p = self._cover_cache_path(v)
-                        if p and os.path.exists(p):
-                            loaded[k] = p
-                            changed = True
-                self._offline_covers_map = loaded
-                if changed:
-                    self._save_offline_covers_map()
-            else:
-                self._offline_covers_map = {}
-                self._save_offline_covers_map()
-        except FileNotFoundError:
-            self._offline_covers_map = {}
-            self._save_offline_covers_map()
-        except Exception:
-            self._offline_covers_map = {}
+        loaded, changed = AppStateService.load_offline_covers_map(
+            path=OFFLINE_COVERS_MAP_PATH,
+            resolve_legacy_cover_path=self._cover_cache_path,
+        )
+        self._offline_covers_map = loaded
+        if changed:
             self._save_offline_covers_map()
 
     def _save_offline_covers_map(self):
         if self._incognito_enabled:
             return
-        tmp = OFFLINE_COVERS_MAP_PATH + ".tmp"
         try:
-            with open(tmp, "w", encoding="utf-8") as f:
-                json.dump(self._offline_covers_map, f, ensure_ascii=False, indent=2)
-            os.replace(tmp, OFFLINE_COVERS_MAP_PATH)
+            AppStateService.save_offline_covers_map(self._offline_covers_map, OFFLINE_COVERS_MAP_PATH)
         except Exception:
-            try:
-                if os.path.exists(tmp):
-                    os.remove(tmp)
-            except Exception:
-                pass
+            pass
 
     def _remember_offline_cover_url(self, anime_name: str, cover_url: str | None):
         if self._incognito_enabled:
             return
-        if not cover_url:
-            return
-        cache_path = self._cover_cache_path(cover_url)
-        if not cache_path or not os.path.exists(cache_path):
-            return
-        key = self._safe_name(anime_name).lower()
-        if not key:
-            return
-        if self._offline_covers_map.get(key) == cache_path:
-            return
-        self._offline_covers_map[key] = cache_path
-        self._save_offline_covers_map()
+        changed = AppStateService.remember_offline_cover(
+            self._offline_covers_map,
+            anime_name=anime_name,
+            cover_url=cover_url,
+            safe_name=self._safe_name,
+            cover_cache_path=self._cover_cache_path,
+        )
+        if changed:
+            self._save_offline_covers_map()
 
     def _add_recent_query(self, q: str):
         q = q.strip()
@@ -4593,11 +3568,7 @@ class MainWindow(PlayerMixin, SearchMixin, DownloadMixin, UpdateMixin, HistoryMi
     def on_clear_search_history(self):
         self._recent_queries = []
         if not self._incognito_enabled:
-            try:
-                if os.path.exists(SEARCH_HISTORY_PATH):
-                    os.remove(SEARCH_HISTORY_PATH)
-            except Exception:
-                pass
+            AppStateService.clear_search_history(SEARCH_HISTORY_PATH)
         self._refresh_recent_queries_ui()
 
     def _refresh_recent_queries_ui(self):
@@ -4694,7 +3665,8 @@ class MainWindow(PlayerMixin, SearchMixin, DownloadMixin, UpdateMixin, HistoryMi
 
 def main():
     debug_log("Application start")
-    app = QApplication(sys.argv)
+    app = LoggingApplication(sys.argv)
+    app._ui_freeze_watchdog = UiFreezeWatchdog()
     w = MainWindow()
     w.show()
     debug_log("Application UI shown, entering event loop")
@@ -4703,3 +3675,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+

@@ -6,6 +6,9 @@ import os
 import platform
 import sys
 
+from crash_logging import install_exception_hooks, setup_logging
+from services import APP_VERSION
+
 
 def _has_xcb_cursor_lib() -> bool:
     probe_names = ["xcb-cursor", "xcb_cursor"]
@@ -55,6 +58,8 @@ def _linux_qt_runtime_guard() -> int:
 
 
 if __name__ == "__main__":
+    setup_logging(app_version=APP_VERSION)
+    install_exception_hooks()
     code = _linux_qt_runtime_guard()
     if code != 0:
         raise SystemExit(code)

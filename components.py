@@ -14,15 +14,13 @@ from dataclasses import dataclass
 from typing import Any, Callable
 import errno
 import threading
+from crash_logging import log_debug
 from PySide6.QtCore import Qt, QThread, Signal
 from PySide6.QtWidgets import QWidget
 
 
 def debug_log(msg: str) -> None:
-    ts = time.strftime("%H:%M:%S")
-    ms = int((time.time() % 1) * 1000)
-    thread_name = threading.current_thread().name
-    print(f"[anigui {ts}.{ms:03d}] [{thread_name}] {msg}", flush=True)
+    log_debug(msg)
 
 
 # ---------------------------
@@ -783,5 +781,4 @@ def create_player_widget() -> PlayerBase:
         )
     debug_log(f"Using MpvIpcWidPlayer with mpv_path={mpv_path}")
     return MpvIpcWidPlayer(mpv_path)
-
 

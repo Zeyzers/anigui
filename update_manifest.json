@@ -1,13 +1,13 @@
 {
-    "version":  "1.1.7",
+    "version":  "1.1.8",
     "windows":  {
-                    "url":  "https://github.com/Zeyzers/anigui/releases/download/v1.1.7/AniguiApp.exe",
-                    "sha256":  "a1e13be24fb9d83a14a625910ee6be02e54ba642fb8f8b3472a1ff710ec00486"
+                    "url":  "https://github.com/Zeyzers/anigui/releases/download/v1.1.8/AniguiApp.exe",
+                    "sha256":  "aa0d19ad233da6f8784a71e77098b80097ba5c1ee38b610601a0674f263dc47a"
                 },
     "linux":  {
                   "url":  "https://raw.githubusercontent.com/Zeyzers/anigui/main/app.py",
-                  "sha256":  "aa8f2ca032d8201477e8cc7b649c8106d156e273f0ead4c6009de59ff518c428"
+                  "sha256":  "9c83c1d1f53fdf3833350671cece9ef10aca8a57ce0c9d64847e856fab80cde3"
               },
     "page_url":  "https://github.com/Zeyzers/anigui/releases/latest",
-    "notes":  "Solved no cover on huge lists"
+    "notes":  "Bugfix release focused on stability: fixed text encoding issues, watchlist filter freezes, duplicate anime entries across providers, crash logging, and cover-loading errors that could cause UI stalls."
 }

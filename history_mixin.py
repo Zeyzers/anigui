@@ -21,7 +21,9 @@ from PySide6.QtWidgets import (
 )
 from anipy_api.provider import LanguageTypeEnum
 
+from anilist_service import AniListService
 from components import SearchItem, Worker
+from history_service import apply_mark_episode_completed, build_resume_plan
 from models import HistoryEntry
 
 
@@ -351,6 +353,9 @@ class HistoryMixin:
             return
         if self._try_set_history_cover_from_cache(row, entry):
             return
+        resolved_cover_url = self._normalize_cover_url(getattr(entry, "cover_url", None), entry.provider)
+        if resolved_cover_url and resolved_cover_url != getattr(entry, "cover_url", None):
+            entry.cover_url = resolved_cover_url
         it.setData(Qt.ItemDataRole.UserRole + 1, "loading")
         self._history_cover_inflight_rows.add(row)
         if entry.cover_url:
@@ -442,48 +447,23 @@ class HistoryMixin:
         self,
         entry: HistoryEntry,
     ) -> tuple[str, bool, int, dict[str, Any] | None]:
-        ep_map = self._entry_episode_progress_map(entry)
-        last_epf = self._to_ep_float(entry.last_ep)
-        last_prog = self._entry_get_episode_progress(entry, entry.last_ep)
-        if last_prog is None and last_epf is not None:
-            last_prog = ep_map.get(last_epf)
-        in_progress = False
-        if isinstance(last_prog, dict):
-            lp_pos = float(last_prog.get("pos", 0.0) or 0.0)
-            lp_pct = float(last_prog.get("percent", 0.0) or 0.0)
-            lp_done = bool(last_prog.get("completed", False))
-            in_progress = (not lp_done) and (lp_pos > 0.0 or lp_pct > 0.0)
-        seen_count = len(self._entry_watched_eps_set(entry))
-        status_raw = str(getattr(entry, "watch_status", "") or "").strip().casefold()
-        status_map = {
-            "current": "Watching",
-            "watching": "Watching",
-            "repeating": "Watching",
-            "planning": "Planned",
-            "planned": "Planned",
-            "paused": "Paused",
-            "dropped": "Dropped",
-            "completed": "Completed",
-        }
-        explicit = status_map.get(status_raw, "")
-        if bool(entry.completed) and not in_progress:
-            return "Completed", in_progress, seen_count, last_prog
-        if explicit == "Completed":
-            return "Completed", in_progress, seen_count, last_prog
-        if explicit in {"Paused", "Dropped"}:
-            return explicit, in_progress, seen_count, last_prog
-        if in_progress or seen_count > 0:
-            return "Watching", in_progress, seen_count, last_prog
-        if explicit == "Watching":
-            return "Watching", in_progress, seen_count, last_prog
-        if explicit == "Planned":
-            return "Planned", in_progress, seen_count, last_prog
-        return "Planned", in_progress, seen_count, last_prog
+        return AniListService.entry_status(entry)
 
     def on_history_filter_changed(self):
         self._history_filter = str(self.combo_history_filter.currentData() or "All")
         self._selected_history = None
-        self.refresh_history_ui()
+        self._queue_history_refresh()
+
+    def _queue_history_refresh(self):
+        if bool(getattr(self, "_history_refresh_queued", False)):
+            return
+        self._history_refresh_queued = True
+
+        def _run():
+            self._history_refresh_queued = False
+            self.refresh_history_ui()
+
+        QTimer.singleShot(0, _run)
 
     def _on_history_cover_resolved(
         self,
@@ -630,49 +610,19 @@ class HistoryMixin:
                 item.setSizeHint(QSize(0, 44))
                 self.episodes.addItem(item)
 
-            target_ep = eps[0] if eps else e.last_ep
-            should_seek_resume = not e.completed
-
-            # map history episode (float) to the exact episode object returned by provider
-            # to avoid provider edge cases where 1.0 != "1"/1 internally
-            matched_idx = None
-            for i, ep in enumerate(eps):
-                try:
-                    if abs(float(ep) - float(e.last_ep)) < 1e-6:
-                        matched_idx = i
-                        break
-                except Exception:
-                    continue
-
-            if matched_idx is not None:
-                if e.completed and matched_idx + 1 < len(eps):
-                    target_ep = eps[matched_idx + 1]
-                else:
-                    target_ep = eps[matched_idx]
-            elif e.completed:
-                for ep in eps:
-                    try:
-                        if float(ep) > float(e.last_ep):
-                            target_ep = ep
-                            break
-                    except Exception:
-                        continue
+            plan = build_resume_plan(e, eps)
 
             self._pending_resume_seek = None
             self._pending_resume_seek_ratio = None
             self._pending_resume_seek_attempts = 0
-            if should_seek_resume:
-                if float(e.last_pos) > 0.0:
-                    self._pending_resume_seek = max(0.0, float(e.last_pos) - 5.0)
-                if float(getattr(e, "last_percent", 0.0) or 0.0) > 0.0:
-                    self._pending_resume_seek_ratio = max(
-                        0.0, min(1.0, (float(e.last_percent) / 100.0) - 0.01)
-                    )
-                self._resume_marker_pos = max(0.0, float(e.last_pos))
+            if plan.should_seek_resume:
+                self._pending_resume_seek = plan.seek_pos
+                self._pending_resume_seek_ratio = plan.seek_ratio
+                self._resume_marker_pos = plan.resume_marker_pos
             else:
                 self._resume_marker_pos = None
 
-            self.play_episode(target_ep)
+            self.play_episode(plan.target_ep)
 
         w = Worker(self.do_episodes, self.selected_anime)
         w.ok.connect(after_eps)
@@ -687,21 +637,11 @@ class HistoryMixin:
         if not getattr(self, "_selected_history", None):
             return
         e: HistoryEntry = self._selected_history
-        cur_prog = self._entry_get_episode_progress(e, e.last_ep) or {}
-        cur_dur = float(cur_prog.get("dur", e.last_duration) or 0.0)
-        self._entry_add_watched_ep(e, e.last_ep)
-        self._entry_set_episode_progress(
+        apply_mark_episode_completed(
             e,
             e.last_ep,
-            pos=cur_dur if cur_dur > 0 else float(cur_prog.get("pos", e.last_pos) or 0.0),
-            dur=cur_dur,
-            percent=100.0,
-            completed=True,
+            now_ts=time.time(),
         )
-        e.last_percent = 100.0
-        e.updated_at = time.time()
-        if not bool(getattr(e, "completed", False)):
-            e.watch_status = "Watching"
         self.history.upsert(e)
         self.refresh_history_ui()
         self.on_history_resume()
@@ -713,23 +653,12 @@ class HistoryMixin:
         if not getattr(self, "_selected_history", None):
             return
         e: HistoryEntry = self._selected_history
-        if e.last_duration > 0:
-            e.last_pos = e.last_duration
-        else:
-            e.last_pos = max(0.0, float(e.last_pos))
-        self._entry_add_watched_ep(e, e.last_ep)
-        self._entry_set_episode_progress(
+        apply_mark_episode_completed(
             e,
             e.last_ep,
-            pos=float(e.last_pos),
-            dur=float(e.last_duration),
-            percent=100.0,
-            completed=True,
+            fallback_pos=float(e.last_duration) if e.last_duration > 0 else max(0.0, float(e.last_pos)),
+            now_ts=time.time(),
         )
-        e.last_percent = 100.0
-        e.updated_at = time.time()
-        if not bool(getattr(e, "completed", False)):
-            e.watch_status = "Watching"
         self.history.upsert(e)
         self.refresh_history_ui()
         self.set_status(f"Segnato come visto: {e.name} ep {e.last_ep}")
@@ -779,10 +708,12 @@ class HistoryMixin:
             return
         if not self.history.list():
             return
-        self.history._data = []
         try:
-            if os.path.exists(self.history.path):
-                os.remove(self.history.path)
+            self.history.clear()
         except Exception:
-            pass
+            try:
+                if os.path.exists(self.history.path):
+                    os.remove(self.history.path)
+            except Exception:
+                pass
         self.refresh_history_ui()

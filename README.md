@@ -7,12 +7,14 @@ It includes search, episode playback, watchlist/history management, favorites, d
 
 - Anime search with provider/language/quality selection
 - Episode list and integrated player controls
-- Watchlist with status sections (`Watching`, `Planned`, `Completed`)
+- Watchlist with status sections (`Planned`, `Watching`, `Paused`, `Dropped`, `Completed`)
 - Resume playback from saved progress
 - Favorites management
 - Download queue with parallel tasks
 - Offline library view for downloaded episodes
 - Optional AniList sync/import
+- Backup/restore of app state
+- Update checks
 - UI localization (Italian / English)
 
 ## Platform support
@@ -25,6 +27,9 @@ It includes search, episode playback, watchlist/history management, favorites, d
 - Python **3.10+**
 - `pip`
 - Network access for providers and AniList (if enabled)
+- `mpv`
+
+On Windows source runs, playback requires either `mpv.exe` on `PATH` or a local runtime compatible with the player backends.
 
 ## Installation
 
@@ -35,6 +40,8 @@ python -m venv .venv
 . .venv\Scripts\Activate.ps1
 pip install -r requirements.txt
 ```
+
+Install `mpv` separately and ensure `mpv.exe` is available on `PATH` for playback.
 
 ### Linux (from source)
 
@@ -79,6 +86,23 @@ User data is stored in the OS application state folder:
 
 The app manages these files automatically at runtime.
 
+Default state directory:
+
+- Windows: `%APPDATA%\anigui_app`
+- macOS: `~/Library/Application Support/anigui_app`
+- Linux: `${XDG_STATE_HOME:-~/.local/state}/anigui_app`
+
+Important files:
+
+- `history.json`
+- `search_history.json`
+- `offline_covers.json`
+- `favorites.json`
+- `metadata_cache.json`
+- `settings.json`
+
+Default downloads are stored in `<state-dir>/downloads` unless changed in Settings.
+
 ## AniList
 
 AniList integration is optional. If enabled:
@@ -103,6 +127,7 @@ AniList integration is optional. If enabled:
 
 - Do not commit personal tokens or credentials
 - Keep local settings files private on shared machines
+- AniList tokens are stored in local app settings and may be included in backups
 - External provider endpoints may change or become unavailable
 
 ## Troubleshooting
@@ -118,3 +143,7 @@ AniList integration is optional. If enabled:
 
 This repository is focused on the application source and runtime behavior.
 Windows binaries are distributed separately through releases.
+
+## Maintainers
+
+Release/build/update workflow notes now live in [MAINTAINING.md](/MAINTAINING.md).

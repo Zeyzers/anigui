@@ -30,3 +30,6 @@ Thumbs.db
 *.log
 *.tmp
 *.notes
+tests/
+logs/
+MAINTAINING.md
