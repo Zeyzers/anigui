@@ -2,3 +2,4 @@ PySide6
 anipy-api
 python-mpv
 aw-cli
+aiortc

@@ -120,6 +120,7 @@ class MainWindow(PlayerMixin, SearchMixin, DownloadMixin, UpdateMixin, HistoryMi
         self._build_favorites_tab()
         self._build_settings_tab()
         self._build_history_tab()
+        self._build_watchparty_tab()
         self._build_status_bar()
         self._init_runtime_fields()
         self._init_timers()
@@ -834,6 +835,7 @@ class MainWindow(PlayerMixin, SearchMixin, DownloadMixin, UpdateMixin, HistoryMi
         settings_layout.addStretch(1)
 
     def _build_history_tab(self):
+        # existing history tab code continues as is
         # ---- History tab ----
         self.tab_history = QWidget()
         self.tabs.addTab(self.tab_history, "Watchlist")
@@ -896,6 +898,17 @@ class MainWindow(PlayerMixin, SearchMixin, DownloadMixin, UpdateMixin, HistoryMi
         self.btn_clear_watch_history.clicked.connect(self.on_clear_watch_history)
         hist_clear.addWidget(self.btn_clear_watch_history)
         hist_layout.addLayout(hist_clear)
+    def _build_watchparty_tab(self):
+        """Create the Watch‑Party tab and its UI."""
+        from watchparty.watchparty_manager import WatchPartySession
+        from watchparty.watchparty_ui import WatchPartyTab
+        import uuid
+        self.tab_watchparty = QWidget()
+        self.tabs.addTab(self.tab_watchparty, "Watch‑Party")
+        layout = QVBoxLayout(self.tab_watchparty)
+        self.watchparty_session = WatchPartySession(session_id=str(uuid.uuid4()))
+        self.watchparty_ui = WatchPartyTab(self.watchparty_session)
+        layout.addWidget(self.watchparty_ui)
 
     def _build_status_bar(self):
         # status
