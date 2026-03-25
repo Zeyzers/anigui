@@ -7,7 +7,9 @@ the functionality required by ``WatchPartySession``.
 """
 
 import asyncio
+import concurrent.futures
 import logging
+import threading
 
 
 logger = logging.getLogger(__name__)
@@ -35,19 +37,32 @@ class AiortcHandler:
     def __init__(self, is_host: bool, on_message: Callable[[dict], None]):
         self.is_host = is_host
         self.on_message = on_message
-        self.pc = RTCPeerConnection()
+        self.pc: RTCPeerConnection | None = None
         self.channel: RTCDataChannel | None = None
-        # Attach a handler that will be called when the data channel opens.
-        self.pc.on("datachannel", self._on_datachannel)
+        self._loop_runner = _ensure_watchparty_loop()
+        self._loop_runner.submit(self._async_init()).result()
         logger.debug("AiortcHandler initialized, is_host=%s", is_host)
+
+    async def _async_init(self) -> None:
+        self.pc = RTCPeerConnection()
+        self.pc.on("datachannel", self._on_datachannel)
+        self.pc.on(
+            "connectionstatechange",
+            lambda: self._log_pc_state("connectionState", self.pc.connectionState),
+        )
+        self.pc.on(
+            "iceconnectionstatechange",
+            lambda: self._log_pc_state("iceConnectionState", self.pc.iceConnectionState),
+        )
+        self.pc.on(
+            "signalingstatechange",
+            lambda: self._log_pc_state("signalingState", self.pc.signalingState),
+        )
         if self.is_host:
-            # Host creates the channel immediately.
             self.channel = self.pc.createDataChannel("control", ordered=True)
-            self.channel.on("message", self._handle_message)
-            self.channel.on("open", lambda: logger.info("Data channel opened (host)"))
-            self.channel.on("close", lambda: logger.info("Data channel closed (host)"))
-            self.channel.on("error", lambda e: logger.error(f"Data channel error (host): {e}"))
-            logger.debug("Created data channel 'control' for host")
+            self._attach_channel_handlers(self.channel, role="host")
+            print("WATCHPARTY DATA CHANNEL CREATED role=host", flush=True)
+            logger.debug("Watchparty data channel created (host)")
 
     # ---------------------------------------------------------------------
     # Signaling helpers
@@ -84,11 +99,25 @@ class AiortcHandler:
         For the guest endpoint we receive the ``control`` channel here.
         """
         self.channel = channel
-        self.channel.on("message", self._handle_message)
-        self.channel.on("open", lambda: logger.info("Data channel opened (guest)"))
-        self.channel.on("close", lambda: logger.info("Data channel closed (guest)"))
-        self.channel.on("error", lambda e: logger.error(f"Data channel error (guest): {e}"))
-        logger.debug("Received remote data channel")
+        self._attach_channel_handlers(self.channel, role="guest")
+        print("WATCHPARTY DATA CHANNEL CREATED role=guest", flush=True)
+        logger.debug("Watchparty data channel created (guest)")
+
+    def _attach_channel_handlers(self, channel: RTCDataChannel, role: str) -> None:
+        channel.on("message", self._handle_message)
+        channel.on(
+            "open",
+            lambda: (
+                print(f"WATCHPARTY DATA CHANNEL OPEN role={role}", flush=True),
+                logger.info("Watchparty data channel open (%s)", role),
+            ),
+        )
+        channel.on("close", lambda: logger.info("Data channel closed (%s)", role))
+        channel.on("error", lambda e: logger.error("Data channel error (%s): %s", role, e))
+
+    def _log_pc_state(self, label: str, value: str) -> None:
+        print(f"WATCHPARTY {label}={value}", flush=True)
+        logger.info("Watchparty %s=%s", label, value)
 
     def _handle_message(self, message: str) -> None:
         """Parse a JSON message received from the peer and forward it to the
@@ -103,10 +132,14 @@ class AiortcHandler:
         self.on_message(data)
 
     async def send(self, payload: dict) -> None:
-        logger.debug("Sending payload over data channel: %s", payload)
+        logger.debug("Watchparty send attempted: %s", payload)
         if self.channel is None:
             raise RuntimeError("Data channel not established yet")
-        await self.channel.send(json.dumps(payload))
+        try:
+            self.channel.send(json.dumps(payload))
+        except Exception:
+            logger.exception("Watchparty send failed")
+            raise
 
     # ---------------------------------------------------------------------
     # Utility
@@ -127,16 +160,44 @@ class AiortcHandler:
 # in a background event loop for convenience.
 # -------------------------------------------------------------------------
 
+
+class _WatchPartyLoopRunner:
+    def __init__(self):
+        self.loop = asyncio.new_event_loop()
+        self.thread = threading.Thread(
+            target=self._run_loop,
+            name="WatchPartyLoop",
+            daemon=True,
+        )
+        self._started = threading.Event()
+        self.thread.start()
+        self._started.wait()
+
+    def _run_loop(self) -> None:
+        asyncio.set_event_loop(self.loop)
+        print("WATCHPARTY EVENT LOOP THREAD STARTED", flush=True)
+        logger.info("Watchparty event loop thread started")
+        self._started.set()
+        self.loop.run_forever()
+
+    def submit(self, coro: Any) -> concurrent.futures.Future:
+        print(f"WATCHPARTY COROUTINE SCHEDULED {coro!r}", flush=True)
+        logger.debug("Watchparty coroutine scheduled: %r", coro)
+        return asyncio.run_coroutine_threadsafe(coro, self.loop)
+
+
+_WATCHPARTY_LOOP_RUNNER: _WatchPartyLoopRunner | None = None
+
+
+def _ensure_watchparty_loop() -> _WatchPartyLoopRunner:
+    global _WATCHPARTY_LOOP_RUNNER
+    if _WATCHPARTY_LOOP_RUNNER is None:
+        _WATCHPARTY_LOOP_RUNNER = _WatchPartyLoopRunner()
+    return _WATCHPARTY_LOOP_RUNNER
+
 def run_async(coro: Any) -> Any:
-    """Execute *coro* in a fresh event loop and return the result.
-    This avoids "coroutine was never awaited" warnings when no loop is running.
-    """
-    try:
-        loop = asyncio.get_event_loop()
-    except RuntimeError:
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-    return loop.run_until_complete(coro)
+    """Execute *coro* on the dedicated watchparty event loop and return the result."""
+    return _ensure_watchparty_loop().submit(coro).result()
 
 """End of file
 """

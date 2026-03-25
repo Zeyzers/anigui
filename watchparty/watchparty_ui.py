@@ -12,6 +12,7 @@ from PySide6.QtWidgets import (
     QLineEdit,
     QMessageBox,
 )
+from PySide6.QtCore import Signal, Slot
 import logging
 logger = logging.getLogger(__name__)
 
@@ -19,9 +20,14 @@ from .aiortc_handler import run_async
 
 
 class WatchPartyTab(QWidget):
+    chat_received = Signal(str)
+
     def __init__(self, session, parent=None):
+        print("WATCHPARTY UI INSTANCE CREATED", flush=True)
         super().__init__(parent)
         self.session = session
+        self.chat_received.connect(self._append_remote_message)
+        self.session.on_chat_message = self.chat_received.emit
         self.init_ui()
 
     def init_ui(self):
@@ -73,6 +79,10 @@ class WatchPartyTab(QWidget):
             logger.exception("Failed to send chat message")
             QMessageBox.warning(self, "Error", f"Failed to send message: {e}")
 
+    @Slot(str)
+    def _append_remote_message(self, msg: str) -> None:
+        self.chat.append(f"Peer: {msg}")
+
     def create_party(self):
         """Host creates a new party – start signaling and generate URL."""
         try:
@@ -84,6 +94,7 @@ class WatchPartyTab(QWidget):
 
     def join_party(self):
         """Guest joins an existing party using the URL pasted in the field."""
+        print("JOIN PARTY CLICKED", flush=True)
         url = self.url_field.text().strip()
         if not url:
             QMessageBox.warning(
@@ -91,7 +102,9 @@ class WatchPartyTab(QWidget):
             )
             return
         try:
+            print(f"JOIN URL: {url!r}", flush=True)
             self.session.join_host(url)
             self.info.setText("Connected to host. Ready to chat and sync.")
         except Exception as e:
+            logger.exception("Watchparty guest join failed while fetching offer, creating answer, or posting answer")
             QMessageBox.critical(self, "Join Error", str(e))

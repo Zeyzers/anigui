@@ -19,6 +19,7 @@ logger = logging.getLogger(__name__)
 
 import threading
 import uuid
+import socket
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from urllib.parse import urlparse, parse_qs
 
@@ -74,7 +75,12 @@ class _SignalingHandler(BaseHTTPRequestHandler):
                 self.wfile.write(b"{\"error\": \"invalid JSON\"}")
                 logger.warning("Invalid JSON in /answer POST for session %s", session_id)
                 return
+            print(f"SIGNALING STORE ANSWER session_id={session_id!r}", flush=True)
             self._store["answers"][session_id] = answer
+            print(
+                f"SIGNALING ANSWER STORED keys={list(self._store['answers'].keys())}",
+                flush=True,
+            )
             self._set_json(200)
             self.wfile.write(b"{\"status\": \"ok\"}")
             logger.info("Stored answer for session %s", session_id)
@@ -103,7 +109,12 @@ class _SignalingHandler(BaseHTTPRequestHandler):
         if parsed.path.startswith("/answer/"):
             # Host polls for the answer.
             session_id = parsed.path.split("/")[-1]
+            print(f"SIGNALING GET ANSWER LOOKUP session_id={session_id!r}", flush=True)
             answer = self._store["answers"].get(session_id)
+            print(
+                f"SIGNALING GET ANSWER EXISTS={answer is not None}",
+                flush=True,
+            )
             if answer is None:
                 self._set_json(404)
                 self.wfile.write(b"{\"error\": \"answer not found\"}")
@@ -131,10 +142,17 @@ class SignalingServer:
     address can be retrieved via ``self.url`` after ``start()``.
     """
 
-    def __init__(self, host: str = "127.0.0.1", port: int = 0):
+    def __init__(
+        self,
+        host: str = "0.0.0.0",
+        port: int = 0,
+        advertised_host: str | None = None,
+    ):
         self.server = HTTPServer((host, port), _SignalingHandler)
         self.thread: threading.Thread | None = None
-        self.url = f"http://{self.server.server_address[0]}:{self.server.server_address[1]}"
+        if advertised_host is None:
+            advertised_host = self._detect_advertised_host()
+        self.url = f"http://{advertised_host}:{self.server.server_address[1]}"
 
     def start(self) -> None:
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
@@ -146,3 +164,10 @@ class SignalingServer:
         if self.thread:
             self.thread.join()
 
+    def _detect_advertised_host(self) -> str:
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+                s.connect(("8.8.8.8", 80))
+                return s.getsockname()[0]
+        except OSError:
+            return "127.0.0.1"
