@@ -81,6 +81,8 @@ class WatchPartyTab(QWidget):
 
     @Slot(str)
     def _append_remote_message(self, msg: str) -> None:
+        print(f"UI RECEIVED CHAT msg={msg!r}", flush=True)
+        print("UI APPENDING CHAT MESSAGE", flush=True)
         self.chat.append(f"Peer: {msg}")
 
     def create_party(self):

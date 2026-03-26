@@ -123,12 +123,14 @@ class AiortcHandler:
         """Parse a JSON message received from the peer and forward it to the
         user‑provided ``on_message`` callback.
         """
+        print(f"DATA CHANNEL MESSAGE RECEIVED raw={message!r}", flush=True)
         try:
             data = json.loads(message)
         except json.JSONDecodeError:
             # Silently ignore malformed payloads – they are not part of the
             # protocol.
             return
+        print("FORWARDING MESSAGE TO SESSION", flush=True)
         self.on_message(data)
 
     async def send(self, payload: dict) -> None:

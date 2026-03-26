@@ -193,10 +193,13 @@ class WatchPartySession:
         """Dispatch incoming JSON messages to appropriate session actions.
         Expected keys: ``type`` ("chat", "sync", "media_change").
         """
+        print(f"SESSION HANDLE INCOMING type={data.get('type')} data={data!r}", flush=True)
         msg_type = data.get("type")
         if msg_type == "chat":
+            print(f"SESSION CHAT RECEIVED msg={data.get('msg')!r}", flush=True)
             self._last_chat = data.get("msg")
             if callable(self.on_chat_message):
+                print("EMITTING CHAT SIGNAL TO UI", flush=True)
                 self.on_chat_message(self._last_chat)
         elif msg_type == "sync":
             self._last_sync = data.get("ts")
