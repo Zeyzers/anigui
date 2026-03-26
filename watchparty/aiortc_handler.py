@@ -61,7 +61,6 @@ class AiortcHandler:
         if self.is_host:
             self.channel = self.pc.createDataChannel("control", ordered=True)
             self._attach_channel_handlers(self.channel, role="host")
-            print("WATCHPARTY DATA CHANNEL CREATED role=host", flush=True)
             logger.debug("Watchparty data channel created (host)")
 
     # ---------------------------------------------------------------------
@@ -100,7 +99,6 @@ class AiortcHandler:
         """
         self.channel = channel
         self._attach_channel_handlers(self.channel, role="guest")
-        print("WATCHPARTY DATA CHANNEL CREATED role=guest", flush=True)
         logger.debug("Watchparty data channel created (guest)")
 
     def _attach_channel_handlers(self, channel: RTCDataChannel, role: str) -> None:
@@ -108,7 +106,6 @@ class AiortcHandler:
         channel.on(
             "open",
             lambda: (
-                print(f"WATCHPARTY DATA CHANNEL OPEN role={role}", flush=True),
                 logger.info("Watchparty data channel open (%s)", role),
             ),
         )
@@ -116,21 +113,18 @@ class AiortcHandler:
         channel.on("error", lambda e: logger.error("Data channel error (%s): %s", role, e))
 
     def _log_pc_state(self, label: str, value: str) -> None:
-        print(f"WATCHPARTY {label}={value}", flush=True)
         logger.info("Watchparty %s=%s", label, value)
 
     def _handle_message(self, message: str) -> None:
         """Parse a JSON message received from the peer and forward it to the
         user‑provided ``on_message`` callback.
         """
-        print(f"DATA CHANNEL MESSAGE RECEIVED raw={message!r}", flush=True)
         try:
             data = json.loads(message)
         except json.JSONDecodeError:
             # Silently ignore malformed payloads – they are not part of the
             # protocol.
             return
-        print("FORWARDING MESSAGE TO SESSION", flush=True)
         self.on_message(data)
 
     async def send(self, payload: dict) -> None:
@@ -177,13 +171,11 @@ class _WatchPartyLoopRunner:
 
     def _run_loop(self) -> None:
         asyncio.set_event_loop(self.loop)
-        print("WATCHPARTY EVENT LOOP THREAD STARTED", flush=True)
         logger.info("Watchparty event loop thread started")
         self._started.set()
         self.loop.run_forever()
 
     def submit(self, coro: Any) -> concurrent.futures.Future:
-        print(f"WATCHPARTY COROUTINE SCHEDULED {coro!r}", flush=True)
         logger.debug("Watchparty coroutine scheduled: %r", coro)
         return asyncio.run_coroutine_threadsafe(coro, self.loop)
 

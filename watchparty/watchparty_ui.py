@@ -23,7 +23,6 @@ class WatchPartyTab(QWidget):
     chat_received = Signal(str)
 
     def __init__(self, session, parent=None):
-        print("WATCHPARTY UI INSTANCE CREATED", flush=True)
         super().__init__(parent)
         self.session = session
         self.chat_received.connect(self._append_remote_message)
@@ -81,8 +80,6 @@ class WatchPartyTab(QWidget):
 
     @Slot(str)
     def _append_remote_message(self, msg: str) -> None:
-        print(f"UI RECEIVED CHAT msg={msg!r}", flush=True)
-        print("UI APPENDING CHAT MESSAGE", flush=True)
         self.chat.append(f"Peer: {msg}")
 
     def create_party(self):
@@ -96,7 +93,6 @@ class WatchPartyTab(QWidget):
 
     def join_party(self):
         """Guest joins an existing party using the URL pasted in the field."""
-        print("JOIN PARTY CLICKED", flush=True)
         url = self.url_field.text().strip()
         if not url:
             QMessageBox.warning(
@@ -104,7 +100,6 @@ class WatchPartyTab(QWidget):
             )
             return
         try:
-            print(f"JOIN URL: {url!r}", flush=True)
             self.session.join_host(url)
             self.info.setText("Connected to host. Ready to chat and sync.")
         except Exception as e:

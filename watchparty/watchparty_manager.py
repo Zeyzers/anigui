@@ -115,27 +115,16 @@ class WatchPartySession:
         logger.info("Host session created with ID %s", session_id)
         # Start background thread to poll for answer.
         def poll_answer():
-            print(f"HOST POLL START session_id={session_id!r}", flush=True)
             while self.is_active:
                 try:
-                    print(f"HOST POLL GET session_id={session_id!r}", flush=True)
                     r = requests.get(f"{self.signaling.url}/answer/{session_id}")
-                    print(f"HOST POLL GET status={r.status_code}", flush=True)
                     if r.status_code == 200:
-                        print(f"HOST POLL GOT ANSWER raw={r.text!r}", flush=True)
                         answer = r.json()
-                        print(
-                            f"HOST POLL ANSWER JSON type={type(answer)} keys={list(answer.keys()) if isinstance(answer, dict) else answer}",
-                            flush=True,
-                        )
                         logger.debug("Watchparty answer fetched from signaling server: %s", answer)
-                        print("HOST APPLY REMOTE ANSWER start", flush=True)
                         run_async(self.handler.set_remote(answer))
-                        print("HOST APPLY REMOTE ANSWER done", flush=True)
                         logger.debug("Watchparty remote answer applied on host")
                         break
                 except Exception as e:
-                    print(f"HOST POLL/APPLY EXCEPTION: {e!r}", flush=True)
                     logger.exception("Error polling for answer: %s", e)
                     raise
                 time.sleep(0.5)
@@ -148,7 +137,6 @@ class WatchPartySession:
         """Join an existing host using the URL provided by the host.
         The method fetches the SDP offer, creates an answer, and posts it back.
         """
-        print(f"JOIN_HOST START url={offer_url!r}", flush=True)
         self.role = "guest"
         logger.info("Joining host with URL %s", offer_url)
         # Extract base URL and session ID.
@@ -159,47 +147,30 @@ class WatchPartySession:
         logger.debug("AiortcHandler created for guest")
         try:
             # Retrieve the offer.
-            print(f"JOIN_HOST GET offer_url={offer_url!r}", flush=True)
             r = requests.get(offer_url)
-            print(f"JOIN_HOST GOT OFFER status={r.status_code}", flush=True)
             r.raise_for_status()
             offer = r.json()
-            print(
-                f"JOIN_HOST OFFER JSON OK keys={list(offer.keys()) if isinstance(offer, dict) else type(offer)}",
-                flush=True,
-            )
             logger.debug("Watchparty offer fetched from host: %s", offer)
             # Create answer; create_answer() applies the remote offer internally.
-            print("JOIN_HOST CREATE_ANSWER start", flush=True)
             answer = run_async(self.handler.create_answer(offer))
             answer_payload = json.loads(answer)
-            print(f"JOIN_HOST CREATE_ANSWER done type={type(answer_payload)}", flush=True)
             logger.debug("Watchparty answer created: %s", answer)
             # POST answer back to host.
-            print(
-                f"JOIN_HOST POST answer session_id={session_id!r} base_url={base_url!r}",
-                flush=True,
-            )
             resp = requests.post(f"{base_url}/answer/{session_id}", json=answer_payload)
-            print(f"JOIN_HOST POST ANSWER status={resp.status_code}", flush=True)
             resp.raise_for_status()
             logger.debug("Watchparty answer posted to host for session %s", session_id)
             # No further polling needed – connection established.
         except Exception as e:
-            print(f"JOIN_HOST EXCEPTION: {e!r}", flush=True)
             raise
 
     def _handle_incoming(self, data: dict) -> None:
         """Dispatch incoming JSON messages to appropriate session actions.
         Expected keys: ``type`` ("chat", "sync", "media_change").
         """
-        print(f"SESSION HANDLE INCOMING type={data.get('type')} data={data!r}", flush=True)
         msg_type = data.get("type")
         if msg_type == "chat":
-            print(f"SESSION CHAT RECEIVED msg={data.get('msg')!r}", flush=True)
             self._last_chat = data.get("msg")
             if callable(self.on_chat_message):
-                print("EMITTING CHAT SIGNAL TO UI", flush=True)
                 self.on_chat_message(self._last_chat)
         elif msg_type == "sync":
             self._last_sync = data.get("ts")

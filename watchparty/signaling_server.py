@@ -75,12 +75,7 @@ class _SignalingHandler(BaseHTTPRequestHandler):
                 self.wfile.write(b"{\"error\": \"invalid JSON\"}")
                 logger.warning("Invalid JSON in /answer POST for session %s", session_id)
                 return
-            print(f"SIGNALING STORE ANSWER session_id={session_id!r}", flush=True)
             self._store["answers"][session_id] = answer
-            print(
-                f"SIGNALING ANSWER STORED keys={list(self._store['answers'].keys())}",
-                flush=True,
-            )
             self._set_json(200)
             self.wfile.write(b"{\"status\": \"ok\"}")
             logger.info("Stored answer for session %s", session_id)
@@ -109,12 +104,7 @@ class _SignalingHandler(BaseHTTPRequestHandler):
         if parsed.path.startswith("/answer/"):
             # Host polls for the answer.
             session_id = parsed.path.split("/")[-1]
-            print(f"SIGNALING GET ANSWER LOOKUP session_id={session_id!r}", flush=True)
             answer = self._store["answers"].get(session_id)
-            print(
-                f"SIGNALING GET ANSWER EXISTS={answer is not None}",
-                flush=True,
-            )
             if answer is None:
                 self._set_json(404)
                 self.wfile.write(b"{\"error\": \"answer not found\"}")

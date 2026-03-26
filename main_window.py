@@ -900,7 +900,6 @@ class MainWindow(PlayerMixin, SearchMixin, DownloadMixin, UpdateMixin, HistoryMi
         hist_layout.addLayout(hist_clear)
     def _build_watchparty_tab(self):
         """Create the Watch‑Party tab and its UI."""
-        print("WATCHPARTY TAB BUILD CALLED", flush=True)
         from watchparty.watchparty_manager import WatchPartySession
         from watchparty.watchparty_ui import WatchPartyTab
         import uuid
