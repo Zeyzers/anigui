@@ -34,11 +34,20 @@ class AiortcHandler:
         channel. The callback receives the parsed JSON payload.
     """
 
-    def __init__(self, is_host: bool, on_message: Callable[[dict], None]):
+    def __init__(
+        self,
+        is_host: bool,
+        on_message: Callable[[dict], None],
+        on_disconnect: Callable[[], None] | None = None,
+        on_channel_open: Callable[[], None] | None = None,
+    ):
         self.is_host = is_host
         self.on_message = on_message
+        self.on_disconnect = on_disconnect
+        self.on_channel_open = on_channel_open
         self.pc: RTCPeerConnection | None = None
         self.channel: RTCDataChannel | None = None
+        self._disconnect_notified = False
         self._loop_runner = _ensure_watchparty_loop()
         self._loop_runner.submit(self._async_init()).result()
         logger.debug("AiortcHandler initialized, is_host=%s", is_host)
@@ -48,7 +57,7 @@ class AiortcHandler:
         self.pc.on("datachannel", self._on_datachannel)
         self.pc.on(
             "connectionstatechange",
-            lambda: self._log_pc_state("connectionState", self.pc.connectionState),
+            lambda: self._handle_connection_state_change(),
         )
         self.pc.on(
             "iceconnectionstatechange",
@@ -105,15 +114,43 @@ class AiortcHandler:
         channel.on("message", self._handle_message)
         channel.on(
             "open",
+            lambda: self._handle_channel_open(role),
+        )
+        channel.on(
+            "close",
             lambda: (
-                logger.info("Watchparty data channel open (%s)", role),
+                logger.info("Data channel closed (%s)", role),
+                self._notify_disconnect(),
             ),
         )
-        channel.on("close", lambda: logger.info("Data channel closed (%s)", role))
         channel.on("error", lambda e: logger.error("Data channel error (%s): %s", role, e))
 
     def _log_pc_state(self, label: str, value: str) -> None:
         logger.info("Watchparty %s=%s", label, value)
+
+    def _handle_channel_open(self, role: str) -> None:
+        logger.info("Watchparty data channel open (%s)", role)
+        if callable(self.on_channel_open):
+            try:
+                self.on_channel_open()
+            except Exception:
+                logger.exception("Watchparty channel-open callback failed")
+
+    def _handle_connection_state_change(self) -> None:
+        state = self.pc.connectionState
+        self._log_pc_state("connectionState", state)
+        if state in {"closed", "failed", "disconnected"}:
+            self._notify_disconnect()
+
+    def _notify_disconnect(self) -> None:
+        if self._disconnect_notified:
+            return
+        self._disconnect_notified = True
+        if callable(self.on_disconnect):
+            try:
+                self.on_disconnect()
+            except Exception:
+                logger.exception("Watchparty disconnect callback failed")
 
     def _handle_message(self, message: str) -> None:
         """Parse a JSON message received from the peer and forward it to the

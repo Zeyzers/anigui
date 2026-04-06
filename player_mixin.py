@@ -3,6 +3,7 @@ from __future__ import annotations
 import threading
 import time
 
+from anipy_api.provider import LanguageTypeEnum
 from PySide6.QtCore import QEvent, QPropertyAnimation, Qt, QTimer, QSize
 from PySide6.QtGui import QCursor, QKeySequence, QShortcut
 from PySide6.QtWidgets import (
@@ -31,6 +32,119 @@ def debug_log(msg: str) -> None:
 
 
 class PlayerMixin:
+    def _watchparty_current_state_snapshot(self) -> dict[str, dict[str, object]] | None:
+        if not self.selected_anime or self.current_ep is None:
+            return None
+        identifier = str(
+            getattr(self.selected_anime, "identifier", None)
+            or getattr(self.selected_anime, "_identifier", None)
+            or getattr(self.selected_anime, "ref", "")
+        ).strip()
+        if not identifier:
+            return None
+        name = str(getattr(self.selected_anime, "name", "") or "").strip() or "anime"
+        lang_name = "SUB" if self.lang == LanguageTypeEnum.SUB else "DUB"
+        media_id = f"{self.provider_name}:{identifier}:{lang_name}"
+        position = None
+        if getattr(self, "_pending_resume_seek", None) is not None:
+            position = float(self._pending_resume_seek)
+        else:
+            try:
+                position = self.player.get_time_pos()
+            except Exception:
+                position = None
+        playing = None
+        try:
+            paused = self.player.get_pause()
+            if paused is not None:
+                playing = not bool(paused)
+        except Exception:
+            playing = None
+        media_payload: dict[str, object] = {
+            "type": "media_change",
+            "media_id": media_id,
+            "provider": self.provider_name,
+            "identifier": identifier,
+            "lang": lang_name,
+            "name": name,
+            "episode": self.current_ep,
+        }
+        playback_payload: dict[str, object] = {"type": "playback"}
+        if position is not None:
+            media_payload["position"] = float(position)
+            playback_payload["position"] = float(position)
+        if playing is not None:
+            media_payload["playing"] = bool(playing)
+            playback_payload["action"] = "play" if playing else "pause"
+        else:
+            playback_payload["action"] = "pause"
+        return {
+            "media_change": media_payload,
+            "playback": playback_payload,
+        }
+
+    def _watchparty_broadcast_media_change(self, ep: float | int) -> None:
+        if getattr(self, "_watchparty_applying_remote_control", False):
+            return
+        session = getattr(self, "watchparty_session", None)
+        if session is None or getattr(session, "role", None) != "host":
+            return
+        if not self.selected_anime:
+            return
+        identifier = str(
+            getattr(self.selected_anime, "identifier", None)
+            or getattr(self.selected_anime, "_identifier", None)
+            or getattr(self.selected_anime, "ref", "")
+        ).strip()
+        if not identifier:
+            return
+        name = str(getattr(self.selected_anime, "name", "") or "").strip() or "anime"
+        lang_name = "SUB" if self.lang == LanguageTypeEnum.SUB else "DUB"
+        media_id = f"{self.provider_name}:{identifier}:{lang_name}"
+        position = None
+        if getattr(self, "_pending_resume_seek", None) is not None:
+            position = float(self._pending_resume_seek)
+        else:
+            try:
+                position = self.player.get_time_pos()
+            except Exception:
+                position = None
+        playing = None
+        try:
+            paused = self.player.get_pause()
+            if paused is not None:
+                playing = not bool(paused)
+        except Exception:
+            playing = None
+        try:
+            session.broadcast_media_change(
+                media_id=media_id,
+                provider=self.provider_name,
+                identifier=identifier,
+                lang_name=lang_name,
+                name=name,
+                episode=ep,
+                position=position,
+                playing=playing,
+            )
+        except Exception:
+            pass
+
+    def _watchparty_broadcast_playback(
+        self,
+        action: str,
+        position: float | None = None,
+        ratio: float | None = None,
+    ) -> None:
+        if getattr(self, "_watchparty_applying_remote_control", False):
+            return
+        session = getattr(self, "watchparty_session", None)
+        if session is None or getattr(session, "role", None) != "host":
+            return
+        try:
+            session.broadcast_playback(action, position=position, ratio=ratio)
+        except Exception:
+            pass
 
     def play_episode(self, ep: float | int):
         if not self.selected_anime:
@@ -45,6 +159,7 @@ class PlayerMixin:
         self._local_media_active = False
         self._offline_current_episode_index = None
         self.current_ep = ep
+        self._watchparty_broadcast_media_change(ep)
         self.set_status(f"Risolvo stream ep {ep}…")
         self._set_transport_enabled(False)
 
@@ -70,6 +185,18 @@ class PlayerMixin:
                     QTimer.singleShot(500, self._try_apply_resume_seek)
                 elif self._pending_resume_seek_ratio is not None:
                     QTimer.singleShot(500, self._try_apply_resume_seek_ratio)
+                if getattr(self, "_watchparty_pending_media_position", None) is not None:
+                    self.player.seek(float(self._watchparty_pending_media_position))
+                    self._watchparty_pending_media_position = None
+                pending_playing = getattr(self, "_watchparty_pending_media_playing", None)
+                if pending_playing is not None:
+                    if pending_playing:
+                        self.player.play()
+                    else:
+                        self.player.pause()
+                    self._watchparty_pending_media_playing = None
+                if getattr(self, "_watchparty_applying_remote_control", False):
+                    self._watchparty_applying_remote_control = False
 
                 self.set_status(f"▶ {anime.name} — ep {ep}")
                 debug_log(f"Episode ready: ep={ep}, total flow {time.perf_counter() - t0:.3f}s")
@@ -78,6 +205,10 @@ class PlayerMixin:
 
         def on_err(msg: str):
             debug_log(f"Play episode error: ep={ep} err={msg}")
+            if getattr(self, "_watchparty_applying_remote_control", False):
+                self._watchparty_applying_remote_control = False
+            self._watchparty_pending_media_position = None
+            self._watchparty_pending_media_playing = None
             self.notify_err(msg)
             self.set_status("Errore.")
             self._set_transport_enabled(True)
@@ -446,10 +577,28 @@ class PlayerMixin:
         self.play_episode(self.episodes_list[idx + 1])
 
     def on_toggle_pause(self):
+        prev_paused = None
+        try:
+            prev_paused = self.player.get_pause()
+        except Exception:
+            prev_paused = None
         try:
             self.player.toggle_pause()
         except Exception:
             pass
+        try:
+            paused = self.player.get_pause()
+        except Exception:
+            paused = prev_paused
+        position = None
+        try:
+            position = self.player.get_time_pos()
+        except Exception:
+            position = None
+        if paused is True:
+            self._watchparty_broadcast_playback("pause", position=position)
+        elif paused is False:
+            self._watchparty_broadcast_playback("play", position=position)
 
     def on_volume_changed(self, v: int):
         try:
@@ -477,8 +626,11 @@ class PlayerMixin:
         try:
             if dur is None or dur <= 0:
                 self.player.seek_ratio(ratio)
+                self._watchparty_broadcast_playback("seek", ratio=ratio)
             else:
-                self.player.seek(ratio * dur)
+                target = ratio * dur
+                self.player.seek(target)
+                self._watchparty_broadcast_playback("seek", position=target)
         except Exception:
             pass
 
@@ -510,8 +662,11 @@ class PlayerMixin:
         try:
             if dur is None or dur <= 0:
                 self.player.seek_ratio(ratio)
+                self._watchparty_broadcast_playback("seek", ratio=ratio)
             else:
-                self.player.seek(ratio * dur)
+                target = ratio * dur
+                self.player.seek(target)
+                self._watchparty_broadcast_playback("seek", position=target)
             self._fs_mark_active()
         except Exception:
             pass

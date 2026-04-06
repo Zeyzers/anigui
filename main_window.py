@@ -907,7 +907,10 @@ class MainWindow(PlayerMixin, SearchMixin, DownloadMixin, UpdateMixin, HistoryMi
         self.tabs.addTab(self.tab_watchparty, "Watch‑Party")
         layout = QVBoxLayout(self.tab_watchparty)
         self.watchparty_session = WatchPartySession(session_id=str(uuid.uuid4()))
+        self.watchparty_session.get_host_state_snapshot = self._watchparty_current_state_snapshot
         self.watchparty_ui = WatchPartyTab(self.watchparty_session)
+        self.watchparty_ui.playback_received.connect(self._apply_watchparty_playback)
+        self.watchparty_ui.media_change_received.connect(self._apply_watchparty_media_change)
         layout.addWidget(self.watchparty_ui)
 
     def _build_status_bar(self):
@@ -982,6 +985,9 @@ class MainWindow(PlayerMixin, SearchMixin, DownloadMixin, UpdateMixin, HistoryMi
         self._pending_resume_seek: float | None = None
         self._pending_resume_seek_ratio: float | None = None
         self._pending_resume_seek_attempts = 0
+        self._watchparty_applying_remote_control = False
+        self._watchparty_pending_media_position: float | None = None
+        self._watchparty_pending_media_playing: bool | None = None
         self._local_media_active = False
         self._offline_items: list[OfflineAnimeItem] = []
         self._offline_episode_files: list[str] = []
@@ -1054,6 +1060,83 @@ class MainWindow(PlayerMixin, SearchMixin, DownloadMixin, UpdateMixin, HistoryMi
         self.refresh_favorites_ui()
         QTimer.singleShot(300, self._debug_log_anilist_viewer_startup)
         QTimer.singleShot(1200, self.check_updates_silent)
+
+    def _apply_watchparty_playback(self, payload: object):
+        if not isinstance(payload, dict):
+            return
+        session = getattr(self, "watchparty_session", None)
+        if session is None or session.role != "guest":
+            return
+        action = payload.get("action")
+        position = payload.get("position")
+        ratio = payload.get("ratio")
+        self._watchparty_applying_remote_control = True
+        try:
+            if position is not None:
+                self.player.seek(float(position))
+            elif ratio is not None:
+                self.player.seek_ratio(float(ratio))
+            if action == "play":
+                self.player.play()
+            elif action == "pause":
+                self.player.pause()
+        except Exception:
+            pass
+        finally:
+            self._watchparty_applying_remote_control = False
+
+    def _apply_watchparty_media_change(self, payload: object):
+        if not isinstance(payload, dict):
+            return
+        session = getattr(self, "watchparty_session", None)
+        if session is None or session.role != "guest":
+            return
+        provider = str(payload.get("provider") or "").strip()
+        identifier = str(payload.get("identifier") or "").strip()
+        name = str(payload.get("name") or "").strip() or "anime"
+        lang_name = str(payload.get("lang") or "SUB").upper()
+        episode = payload.get("episode")
+        if not provider or not identifier or episode is None:
+            return
+        self._watchparty_applying_remote_control = True
+        try:
+            self.tabs.setCurrentWidget(self.tab_search)
+            self.provider_name = provider
+            self.lang = LanguageTypeEnum.DUB if lang_name == "DUB" else LanguageTypeEnum.SUB
+            try:
+                pidx = self.provider_combo.findData(self.provider_name)
+                if pidx >= 0:
+                    self.provider_combo.blockSignals(True)
+                    self.provider_combo.setCurrentIndex(pidx)
+                    self.provider_combo.blockSignals(False)
+            except Exception:
+                pass
+            try:
+                self.lang_combo.blockSignals(True)
+                self.lang_combo.setCurrentIndex(1 if self.lang == LanguageTypeEnum.DUB else 0)
+                self.lang_combo.blockSignals(False)
+            except Exception:
+                pass
+            item = SearchItem(
+                name=name,
+                identifier=identifier,
+                languages={self.lang},
+                source=provider,
+            )
+            self.selected_search_item = item
+            self.selected_anime = self.build_anime_from_item(item)
+            self.lbl_anime_title.setText(name)
+            self.lbl_player_title.setText(name)
+            pos = payload.get("position")
+            self._watchparty_pending_media_position = float(pos) if pos is not None else None
+            playing = payload.get("playing")
+            self._watchparty_pending_media_playing = None if playing is None else bool(playing)
+            self.play_episode(episode)
+        except Exception:
+            self._watchparty_pending_media_position = None
+            self._watchparty_pending_media_playing = None
+            self._watchparty_applying_remote_control = False
+            raise
 
     # ---------------- UI helpers ----------------
     def do_resolve_stream(

@@ -16,17 +16,18 @@ from PySide6.QtCore import Signal, Slot
 import logging
 logger = logging.getLogger(__name__)
 
-from .aiortc_handler import run_async
-
-
 class WatchPartyTab(QWidget):
     chat_received = Signal(str)
+    playback_received = Signal(object)
+    media_change_received = Signal(object)
 
     def __init__(self, session, parent=None):
         super().__init__(parent)
         self.session = session
         self.chat_received.connect(self._append_remote_message)
         self.session.on_chat_message = self.chat_received.emit
+        self.session.on_playback_event = self.playback_received.emit
+        self.session.on_media_change = self.media_change_received.emit
         self.init_ui()
 
     def init_ui(self):
@@ -63,17 +64,17 @@ class WatchPartyTab(QWidget):
             return
         self.chat.append(f"You: {msg}")
         self.input.clear()
-        if not hasattr(self.session, "handler") or not self.session.handler:
-            logger.warning("Attempted to send message but session.handler is missing")
-            QMessageBox.warning(self, "Error", "Session not connected")
-            return
-        ch = getattr(self.session.handler, "channel", None)
-        if not (ch and getattr(ch, "readyState", None) == "open"):
+        has_open_guest_channel = False
+        if getattr(self.session, "handler", None) is not None:
+            ch = getattr(self.session.handler, "channel", None)
+            has_open_guest_channel = bool(ch and getattr(ch, "readyState", None) == "open")
+        has_open_host_peer = bool(self.session._connected_host_handlers())
+        if not (has_open_guest_channel or has_open_host_peer):
             logger.warning("Data channel not open when sending message")
             QMessageBox.warning(self, "Error", "Data channel not established yet")
             return
         try:
-            run_async(self.session.handler.send({"type": "chat", "msg": msg}))
+            self.session.send_chat(msg)
         except Exception as e:
             logger.exception("Failed to send chat message")
             QMessageBox.warning(self, "Error", f"Failed to send message: {e}")

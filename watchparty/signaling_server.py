@@ -27,8 +27,9 @@ from urllib.parse import urlparse, parse_qs
 class _SignalingHandler(BaseHTTPRequestHandler):
     # Shared state across all handler instances (class attribute)
     _store = {
-        "offers": {},   # session_id -> offer JSON string
-        "answers": {},  # session_id -> answer JSON string
+        "sessions": {},  # session_id -> {"pending_peers": [peer_id, ...]}
+        "offers": {},   # (session_id, peer_id) -> offer JSON
+        "answers": {},  # (session_id, peer_id) -> answer JSON
     }
 
     def _set_json(self, code=200):
@@ -43,29 +44,84 @@ class _SignalingHandler(BaseHTTPRequestHandler):
     def do_POST(self):
         parsed = urlparse(self.path)
         logger.debug("POST request path: %s", parsed.path)
-        if parsed.path == "/offer":
-            # Host creates a new session – generate an ID and store the offer.
+        if parsed.path == "/session":
+            session_id = str(uuid.uuid4())
+            self._store["sessions"][session_id] = {"pending_peers": []}
+            self._set_json(200)
+            self.wfile.write(json.dumps({"session_id": session_id}).encode())
+            logger.info("Created signaling session %s", session_id)
+            return
+        if parsed.path.startswith("/join/"):
+            session_id = parsed.path.split("/")[-1]
+            session = self._store["sessions"].get(session_id)
+            if session is None:
+                self._set_json(404)
+                self.wfile.write(b"{\"error\": \"session not found\"}")
+                logger.warning("Join POST for unknown session %s", session_id)
+                return
+            body = self._read_body()
+            try:
+                payload = json.loads(body)
+            except json.JSONDecodeError:
+                self._set_json(400)
+                self.wfile.write(b"{\"error\": \"invalid JSON\"}")
+                logger.warning("Invalid JSON in /join POST for session %s", session_id)
+                return
+            peer_id = str(payload.get("peer_id") or "").strip()
+            if not peer_id:
+                self._set_json(400)
+                self.wfile.write(b"{\"error\": \"peer_id required\"}")
+                logger.warning("Missing peer_id in /join POST for session %s", session_id)
+                return
+            pending = session.setdefault("pending_peers", [])
+            if peer_id not in pending:
+                pending.append(peer_id)
+            print(
+                f"JOIN REGISTERED session_id={session_id!r} peer_id={peer_id!r} pending_peers={self._store['sessions'][session_id]['pending_peers']!r}",
+                flush=True,
+            )
+            self._set_json(200)
+            self.wfile.write(b"{\"status\": \"ok\"}")
+            logger.info("Registered peer %s for session %s", peer_id, session_id)
+            return
+        if parsed.path.startswith("/offer/"):
+            parts = parsed.path.strip("/").split("/")
+            if len(parts) != 3:
+                self._set_json(404)
+                self.wfile.write(b"{\"error\": \"unknown endpoint\"}")
+                logger.warning("Invalid offer POST path: %s", parsed.path)
+                return
+            _, session_id, peer_id = parts
+            if session_id not in self._store["sessions"]:
+                self._set_json(404)
+                self.wfile.write(b"{\"error\": \"session not found\"}")
+                logger.warning("Offer POST for unknown session %s", session_id)
+                return
             body = self._read_body()
             try:
                 offer = json.loads(body)
             except json.JSONDecodeError:
                 self._set_json(400)
                 self.wfile.write(b"{\"error\": \"invalid JSON\"}")
-                logger.warning("Invalid JSON in /offer POST")
+                logger.warning("Invalid JSON in /offer POST for session %s peer %s", session_id, peer_id)
                 return
-            session_id = str(uuid.uuid4())
-            self._store["offers"][session_id] = offer
+            self._store["offers"][(session_id, peer_id)] = offer
             self._set_json(200)
-            self.wfile.write(json.dumps({"session_id": session_id}).encode())
-            logger.info("Stored offer for session %s", session_id)
+            self.wfile.write(b"{\"status\": \"ok\"}")
+            logger.info("Stored offer for session %s peer %s", session_id, peer_id)
             return
         if parsed.path.startswith("/answer/"):
-            # Guest posts answer for a known session.
-            session_id = parsed.path.split("/")[-1]
-            if session_id not in self._store["offers"]:
+            parts = parsed.path.strip("/").split("/")
+            if len(parts) != 3:
                 self._set_json(404)
-                self.wfile.write(b"{\"error\": \"session not found\"}")
-                logger.warning("Answer POST for unknown session %s", session_id)
+                self.wfile.write(b"{\"error\": \"unknown endpoint\"}")
+                logger.warning("Invalid answer POST path: %s", parsed.path)
+                return
+            _, session_id, peer_id = parts
+            if (session_id, peer_id) not in self._store["offers"]:
+                self._set_json(404)
+                self.wfile.write(b"{\"error\": \"offer not found\"}")
+                logger.warning("Answer POST for unknown session %s peer %s", session_id, peer_id)
                 return
             body = self._read_body()
             try:
@@ -73,12 +129,12 @@ class _SignalingHandler(BaseHTTPRequestHandler):
             except json.JSONDecodeError:
                 self._set_json(400)
                 self.wfile.write(b"{\"error\": \"invalid JSON\"}")
-                logger.warning("Invalid JSON in /answer POST for session %s", session_id)
+                logger.warning("Invalid JSON in /answer POST for session %s peer %s", session_id, peer_id)
                 return
-            self._store["answers"][session_id] = answer
+            self._store["answers"][(session_id, peer_id)] = answer
             self._set_json(200)
             self.wfile.write(b"{\"status\": \"ok\"}")
-            logger.info("Stored answer for session %s", session_id)
+            logger.info("Stored answer for session %s peer %s", session_id, peer_id)
             return
         # Unknown endpoint
         self._set_json(404)
@@ -88,31 +144,59 @@ class _SignalingHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         parsed = urlparse(self.path)
         logger.debug("GET request path: %s", parsed.path)
-        if parsed.path.startswith("/offer/"):
-            # Guest polls for the offer.
+        if parsed.path.startswith("/join/"):
             session_id = parsed.path.split("/")[-1]
-            offer = self._store["offers"].get(session_id)
+            session = self._store["sessions"].get(session_id)
+            if session is None:
+                self._set_json(404)
+                self.wfile.write(b"{\"error\": \"session not found\"}")
+                logger.warning("GET join not found for session %s", session_id)
+                return
+            pending = list(session.get("pending_peers", []))
+            print(
+                f"HOST JOIN POLL RETURN session_id={session_id!r} pending_peers_before_clear={pending!r}",
+                flush=True,
+            )
+            session["pending_peers"] = []
+            self._set_json(200)
+            self.wfile.write(json.dumps({"peer_ids": pending}).encode())
+            logger.info("Returned %d pending peers for session %s", len(pending), session_id)
+            return
+        if parsed.path.startswith("/offer/"):
+            parts = parsed.path.strip("/").split("/")
+            if len(parts) != 3:
+                self._set_json(404)
+                self.wfile.write(b"{\"error\": \"unknown endpoint\"}")
+                logger.warning("Invalid offer GET path: %s", parsed.path)
+                return
+            _, session_id, peer_id = parts
+            offer = self._store["offers"].get((session_id, peer_id))
             if offer is None:
                 self._set_json(404)
                 self.wfile.write(b"{\"error\": \"offer not found\"}")
-                logger.warning("GET offer not found for session %s", session_id)
+                logger.warning("GET offer not found for session %s peer %s", session_id, peer_id)
                 return
             self._set_json(200)
             self.wfile.write(json.dumps(offer).encode())
-            logger.info("Returned offer for session %s", session_id)
+            logger.info("Returned offer for session %s peer %s", session_id, peer_id)
             return
         if parsed.path.startswith("/answer/"):
-            # Host polls for the answer.
-            session_id = parsed.path.split("/")[-1]
-            answer = self._store["answers"].get(session_id)
+            parts = parsed.path.strip("/").split("/")
+            if len(parts) != 3:
+                self._set_json(404)
+                self.wfile.write(b"{\"error\": \"unknown endpoint\"}")
+                logger.warning("Invalid answer GET path: %s", parsed.path)
+                return
+            _, session_id, peer_id = parts
+            answer = self._store["answers"].get((session_id, peer_id))
             if answer is None:
                 self._set_json(404)
                 self.wfile.write(b"{\"error\": \"answer not found\"}")
-                logger.warning("GET answer not found for session %s", session_id)
+                logger.warning("GET answer not found for session %s peer %s", session_id, peer_id)
                 return
             self._set_json(200)
             self.wfile.write(json.dumps(answer).encode())
-            logger.info("Returned answer for session %s", session_id)
+            logger.info("Returned answer for session %s peer %s", session_id, peer_id)
             return
         self._set_json(404)
         self.wfile.write(b"{\"error\": \"unknown endpoint\"}")
@@ -153,6 +237,14 @@ class SignalingServer:
             self.server.shutdown()
         if self.thread:
             self.thread.join()
+
+    def remove_peer(self, session_id: str, peer_id: str) -> None:
+        _SignalingHandler._store["offers"].pop((session_id, peer_id), None)
+        _SignalingHandler._store["answers"].pop((session_id, peer_id), None)
+        session = _SignalingHandler._store["sessions"].get(session_id)
+        if session is not None:
+            pending = session.get("pending_peers", [])
+            session["pending_peers"] = [p for p in pending if p != peer_id]
 
     def _detect_advertised_host(self) -> str:
         try:
